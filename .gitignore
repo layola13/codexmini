@@ -1,0 +1,4 @@
+.sa_cache/
+.sla-cache/
+.zig-cache/
+*.sa.bc
