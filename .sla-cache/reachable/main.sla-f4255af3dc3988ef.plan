@@ -1,9 +1,0 @@
-[reachable]
-main
-[types]
-STR_LEN
-J_GET
-root
-println
-JSON_PARSE
-STR_PTR

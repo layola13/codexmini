@@ -1,0 +1,123 @@
+@import "sa_std/string.sa"
+@import "slicex.sa"
+
+// Row encoding helpers for sa_plugin_db (packed little-endian u64 columns).
+// On x86_64 native store/load is little-endian.
+
+// X_STACK_BUF32K %out — 32K stack buffer (single output)
+[MACRO] X_STACK_BUF32K %out
+    %out = stack_alloc 32768
+[END_MACRO]
+
+// X_PRINT_BYTES %out, %ptr, %len — prints bytes via sa_print_bytes.
+// Wraps the call with explicit & capability marker; required because .sla
+// cannot add the marker correctly for heap-allocated ptrs.
+// Single-output so it can be used as an expression in .sla.
+[MACRO] X_PRINT_BYTES %out, %ptr, %len
+    call @sa_print_bytes(&%ptr, %len)
+    %out = 0
+[END_MACRO]
+
+// X_HEAP_BUF8K %out — 8K heap buffer (single output). For buffers that
+// outlive the allocating function (e.g. returned to caller).
+[MACRO] X_HEAP_BUF8K %out
+    %out = alloc 8192
+[END_MACRO]
+
+// X_HEAP_BUF_PTR %out, %size — heap buffer of %size bytes (single output).
+// NOTE: named with the _PTR suffix so the SLA plugin derives a raw_pointer
+// expression result kind (see importedMacroExpressionResultKind); without a
+// known result kind the buffer cannot be passed to other macros (2026-09-18).
+[MACRO] X_HEAP_BUF_PTR %out, %size
+    %out = alloc %size
+[END_MACRO]
+
+// X_LOAD_U8 %out, %ptr — loads a single byte (single output)
+[MACRO] X_LOAD_U8 %out, %ptr
+    %out = load %ptr+0 as u8
+[END_MACRO]
+
+// X_STORE_U8 %ptr, %val — stores a single byte
+[MACRO] X_STORE_U8 %ptr, %val
+    store %ptr+0, %val as u8
+[END_MACRO]
+
+// (X_PTR_ADD lives in slicex.sa, imported above — not redefined here.)
+
+// X_ROW_PUT_U64 %buf, %idx, %val — writes u64 at column idx (statement)
+[MACRO] X_ROW_PUT_U64 %buf, %idx, %val
+    __rpu_off_%buf = mul %idx, 8
+    __rpu_ptr_%buf = ptr_add %buf, __rpu_off_%buf
+    store __rpu_ptr_%buf+0, %val as u64
+    !__rpu_off_%buf
+    !__rpu_ptr_%buf
+[END_MACRO]
+
+// X_ROW_GET_U64 %out, %buf, %idx — reads u64 at column idx (single output)
+[MACRO] X_ROW_GET_U64 %out, %buf, %idx
+    __rgu_off_%out = mul %idx, 8
+    __rgu_ptr_%out = ptr_add %buf, __rgu_off_%out
+    %out = load __rgu_ptr_%out+0 as u64
+    !__rgu_off_%out
+    !__rgu_ptr_%out
+[END_MACRO]
+
+// X_HOME_LEN %out_len — length of $HOME (single output)
+[MACRO] X_HOME_LEN %out_len
+    __dhl_h_%out_len = call @sa_env_home_dir()
+    __dhl_dl_%out_len = call @sa_env_buffer_len(__dhl_h_%out_len)
+    %out_len = __dhl_dl_%out_len
+    !__dhl_h_%out_len
+[END_MACRO]
+
+// X_DB_ROOT_LEN %out_len — length of "$HOME/.scodex-mini/db" (single output)
+[MACRO] X_DB_ROOT_LEN %out_len
+    __drl_h_%out_len = call @sa_env_home_dir()
+    __drl_dl_%out_len = call @sa_env_buffer_len(__drl_h_%out_len)
+    %out_len = add __drl_dl_%out_len, 16
+    !__drl_h_%out_len
+    !__drl_dl_%out_len
+[END_MACRO]
+
+// X_DB_ROOT_PTR %out_ptr — builds "$HOME/.scodex-mini/db" into a heap
+// buffer and returns its ptr. Caller must ensure it lives long enough.
+// Length is X_DB_ROOT_LEN().
+[MACRO] X_DB_ROOT_PTR %out_ptr
+    __dbr_home_h_%out_ptr = call @sa_env_home_dir()
+    // NOTE: sa_env_buffer_data returns the data ptr directly (&ptr is a
+    // borrow annotation, NOT a pointer-to-pointer) — do NOT load through it.
+    __dbr_home_p_%out_ptr = call @sa_env_buffer_data(__dbr_home_h_%out_ptr)
+    // total len for alloc
+    __dbr_dl_a_%out_ptr = call @sa_env_buffer_len(__dbr_home_h_%out_ptr)
+    __dbr_total_%out_ptr = add __dbr_dl_a_%out_ptr, 16
+    __dbr_buf_%out_ptr = alloc __dbr_total_%out_ptr
+    // copy home prefix
+    __dbr_dl_b_%out_ptr = call @sa_env_buffer_len(__dbr_home_h_%out_ptr)
+    EXPAND X_COPY_BYTES __dbr_buf_%out_ptr, __dbr_home_p_%out_ptr, __dbr_dl_b_%out_ptr
+    // suffix offset
+    __dbr_dl_c_%out_ptr = call @sa_env_buffer_len(__dbr_home_h_%out_ptr)
+    __dbr_suf_%out_ptr = ptr_add __dbr_buf_%out_ptr, __dbr_dl_c_%out_ptr
+    store __dbr_suf_%out_ptr+0, 47 as u8
+    store __dbr_suf_%out_ptr+1, 46 as u8
+    store __dbr_suf_%out_ptr+2, 115 as u8
+    store __dbr_suf_%out_ptr+3, 99 as u8
+    store __dbr_suf_%out_ptr+4, 111 as u8
+    store __dbr_suf_%out_ptr+5, 100 as u8
+    store __dbr_suf_%out_ptr+6, 101 as u8
+    store __dbr_suf_%out_ptr+7, 120 as u8
+    store __dbr_suf_%out_ptr+8, 45 as u8
+    store __dbr_suf_%out_ptr+9, 109 as u8
+    store __dbr_suf_%out_ptr+10, 105 as u8
+    store __dbr_suf_%out_ptr+11, 110 as u8
+    store __dbr_suf_%out_ptr+12, 105 as u8
+    store __dbr_suf_%out_ptr+13, 47 as u8
+    store __dbr_suf_%out_ptr+14, 100 as u8
+    store __dbr_suf_%out_ptr+15, 98 as u8
+    %out_ptr = __dbr_buf_%out_ptr
+    !__dbr_home_h_%out_ptr
+    !__dbr_home_p_%out_ptr
+    !__dbr_suf_%out_ptr
+    !__dbr_dl_a_%out_ptr
+    !__dbr_dl_b_%out_ptr
+    !__dbr_dl_c_%out_ptr
+[END_MACRO]

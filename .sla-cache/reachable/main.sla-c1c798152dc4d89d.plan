@@ -1,9 +1,0 @@
-[reachable]
-protocol__mini_tool_call_empty
-main
-mini_tool_call_empty
-[types]
-println
-c
-PTR_NULL
-MiniToolCall

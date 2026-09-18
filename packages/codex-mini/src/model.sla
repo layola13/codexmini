@@ -11,9 +11,14 @@
 @import "protocol.sla"
 @import "http.sla"
 @import "tools.sla"
+@import "plugin_abi/db.sai"
+@import "sa_std/time.sai"
+@import "sessionx.sa"
 
 enum MiniInputKind {
     UserText,
+    AssistantText,
+    FuncCall,
     FuncOutput,
 }
 
@@ -23,6 +28,10 @@ struct MiniInputItem {
     text_len: u64,
     call_id_ptr: ptr,
     call_id_len: u64,
+    name_ptr: ptr,
+    name_len: u64,
+    args_ptr: ptr,
+    args_len: u64,
 }
 
 fn mini_input_user(text_ptr: ptr, text_len: u64) -> MiniInputItem {
@@ -32,6 +41,38 @@ fn mini_input_user(text_ptr: ptr, text_len: u64) -> MiniInputItem {
         text_len: text_len,
         call_id_ptr: PTR_NULL(),
         call_id_len: 0,
+        name_ptr: PTR_NULL(),
+        name_len: 0,
+        args_ptr: PTR_NULL(),
+        args_len: 0,
+    };
+}
+
+fn mini_input_assistant(text_ptr: ptr, text_len: u64) -> MiniInputItem {
+    return MiniInputItem {
+        kind: MiniInputKind::AssistantText,
+        text_ptr: text_ptr,
+        text_len: text_len,
+        call_id_ptr: PTR_NULL(),
+        call_id_len: 0,
+        name_ptr: PTR_NULL(),
+        name_len: 0,
+        args_ptr: PTR_NULL(),
+        args_len: 0,
+    };
+}
+
+fn mini_input_func_call(call_id_ptr: ptr, call_id_len: u64, name_ptr: ptr, name_len: u64, args_ptr: ptr, args_len: u64) -> MiniInputItem {
+    return MiniInputItem {
+        kind: MiniInputKind::FuncCall,
+        text_ptr: PTR_NULL(),
+        text_len: 0,
+        call_id_ptr: call_id_ptr,
+        call_id_len: call_id_len,
+        name_ptr: name_ptr,
+        name_len: name_len,
+        args_ptr: args_ptr,
+        args_len: args_len,
     };
 }
 
@@ -42,6 +83,10 @@ fn mini_input_func_output(call_id_ptr: ptr, call_id_len: u64, out_ptr: ptr, out_
         text_len: out_len,
         call_id_ptr: call_id_ptr,
         call_id_len: call_id_len,
+        name_ptr: PTR_NULL(),
+        name_len: 0,
+        args_ptr: PTR_NULL(),
+        args_len: 0,
     };
 }
 
@@ -74,6 +119,16 @@ fn mini_model_build_request(cfg: MiniConfig, items: Vec<MiniInputItem>) -> ptr {
                 sa_json_writer_field_string(w, STR_PTR("text"), STR_LEN("text"), item.text_ptr, item.text_len);
                 sa_json_writer_end_object(w);
                 sa_json_writer_end_array(w);
+            },
+            MiniInputKind::AssistantText => {
+                sa_json_writer_field_string(w, STR_PTR("role"), STR_LEN("role"), STR_PTR("assistant"), STR_LEN("assistant"));
+                sa_json_writer_field_string(w, STR_PTR("content"), STR_LEN("content"), item.text_ptr, item.text_len);
+            },
+            MiniInputKind::FuncCall => {
+                sa_json_writer_field_string(w, STR_PTR("type"), STR_LEN("type"), STR_PTR("function_call"), STR_LEN("function_call"));
+                sa_json_writer_field_string(w, STR_PTR("call_id"), STR_LEN("call_id"), item.call_id_ptr, item.call_id_len);
+                sa_json_writer_field_string(w, STR_PTR("name"), STR_LEN("name"), item.name_ptr, item.name_len);
+                sa_json_writer_field_string(w, STR_PTR("arguments"), STR_LEN("arguments"), item.args_ptr, item.args_len);
             },
             MiniInputKind::FuncOutput => {
                 sa_json_writer_field_string(w, STR_PTR("type"), STR_LEN("type"), STR_PTR("function_call_output"), STR_LEN("function_call_output"));
@@ -234,10 +289,15 @@ fn mini_model_tool_command(args_ptr: ptr, args_len: u64) -> (ptr, u64, bool) {
 
 // Single-turn agent loop: prompt -> model -> (tool calls -> exec -> model)* -> done.
 // Mirrors the Rust codex-min single-turn behavior.
-fn mini_model_run_turn(cfg: MiniConfig, prompt_ptr: ptr, prompt_len: u64) -> i32 {
+fn mini_model_run_conversation(
+    cfg: MiniConfig,
+    session_id: u64,
+    start_seq: u64,
+    items: Vec<MiniInputItem>
+) -> i32 {
+    var seq: u64;
+    seq = start_seq;
     let (url_ptr, url_len) = mini_model_build_url(cfg);
-    let items: Vec<MiniInputItem> = Vec::new();
-    items.push(mini_input_user(prompt_ptr, prompt_len));
     let turn: u64 = 0;
     while turn < cfg.max_turns {
         let json_buf = mini_model_build_request(cfg, items);
@@ -266,6 +326,15 @@ fn mini_model_run_turn(cfg: MiniConfig, prompt_ptr: ptr, prompt_len: u64) -> i32
             MiniEventKind::TextDelta => {
                 sa_print_bytes(outcome.text_ptr, outcome.text_len);
                 println("");
+                if session_add_message(session_id, seq, 1, outcome.text_ptr, outcome.text_len) != true {
+                    println("scodex-mini: session save failed");
+                    return 1;
+                };
+                seq = seq + 1;
+                if session_bump(session_id, seq) != true {
+                    println("scodex-mini: session save failed");
+                    return 1;
+                };
                 return 0;
             },
             MiniEventKind::ToolCall => {
@@ -273,30 +342,90 @@ fn mini_model_run_turn(cfg: MiniConfig, prompt_ptr: ptr, prompt_len: u64) -> i32
                 let ci: u64 = 0;
                 while ci < ncalls {
                     let call = outcome.calls[ci];
+                    // 1. Save tool call as JSON (role 2). Buffer must stay alive through blob_put.
+                    let w: ptr = PTR_NULL();
+                    sa_json_writer_new(0, 1, 0, 0, 0, &w);
+                    sa_json_writer_begin_object(w);
+                    sa_json_writer_field_string(w, STR_PTR("call_id"), STR_LEN("call_id"), call.call_id_ptr, call.call_id_len);
+                    sa_json_writer_field_string(w, STR_PTR("name"), STR_LEN("name"), call.name_ptr, call.name_len);
+                    sa_json_writer_field_string(w, STR_PTR("args"), STR_LEN("args"), call.args_ptr, call.args_len);
+                    sa_json_writer_end_object(w);
+                    let buf = sa_json_writer_finish_buffer(w);
+                    sa_json_writer_free(w);
+                    let bptr_ref = sa_json_buffer_data(buf);
+                    let bptr: ptr = bptr_ref;
+                    let blen = sa_json_buffer_len(buf);
+                    let save_ok = session_add_message(session_id, seq, 2, bptr, blen);
+                    sa_json_buffer_free(buf);
+                    if save_ok != true {
+                        println("scodex-mini: session save failed");
+                        return 1;
+                    };
+                    seq = seq + 1;
+                    // 2. Execute the tool.
+                    let out_ptr: ptr = PTR_NULL();
+                    let out_len: u64 = 0;
                     if mini_model_str_eq(call.name_ptr, call.name_len, STR_PTR("shell_exec"), STR_LEN("shell_exec")) {
                         let (cmd_ptr, cmd_len, cmd_ok) = mini_model_tool_command(call.args_ptr, call.args_len);
                         if cmd_ok == true {
                             let exec = mini_shell_exec(cmd_ptr, cmd_len);
                             if exec.ok == true {
-                                items.push(mini_input_func_output(call.call_id_ptr, call.call_id_len, exec.out_ptr, exec.out_len));
+                                out_ptr = exec.out_ptr;
+                                out_len = exec.out_len;
                             } else {
-                                items.push(mini_input_func_output(call.call_id_ptr, call.call_id_len, STR_PTR("(exec failed)"), STR_LEN("(exec failed)")));
+                                out_ptr = STR_PTR("(exec failed)");
+                                out_len = STR_LEN("(exec failed)");
                             };
                         } else {
-                            items.push(mini_input_func_output(call.call_id_ptr, call.call_id_len, STR_PTR("(bad arguments)"), STR_LEN("(bad arguments)")));
+                            out_ptr = STR_PTR("(bad arguments)");
+                            out_len = STR_LEN("(bad arguments)");
                         };
                     } else {
-                        items.push(mini_input_func_output(call.call_id_ptr, call.call_id_len, STR_PTR("(unknown tool)"), STR_LEN("(unknown tool)")));
+                        out_ptr = STR_PTR("(unknown tool)");
+                        out_len = STR_LEN("(unknown tool)");
+                    };
+                    // 3. Save tool output as JSON (role 3).
+                    let w2: ptr = PTR_NULL();
+                    sa_json_writer_new(0, 1, 0, 0, 0, &w2);
+                    sa_json_writer_begin_object(w2);
+                    sa_json_writer_field_string(w2, STR_PTR("call_id"), STR_LEN("call_id"), call.call_id_ptr, call.call_id_len);
+                    sa_json_writer_field_string(w2, STR_PTR("output"), STR_LEN("output"), out_ptr, out_len);
+                    sa_json_writer_end_object(w2);
+                    let buf2 = sa_json_writer_finish_buffer(w2);
+                    sa_json_writer_free(w2);
+                    let bptr2_ref = sa_json_buffer_data(buf2);
+                    let bptr2: ptr = bptr2_ref;
+                    let blen2 = sa_json_buffer_len(buf2);
+                    let save2_ok = session_add_message(session_id, seq, 3, bptr2, blen2);
+                    sa_json_buffer_free(buf2);
+                    if save2_ok != true {
+                        println("scodex-mini: session save failed");
+                        return 1;
+                    };
+                    seq = seq + 1;
+                    // 4. Push function output for the next request.
+                    items.push(mini_input_func_output(call.call_id_ptr, call.call_id_len, out_ptr, out_len));
+                    if session_bump(session_id, seq) != true {
+                        println("scodex-mini: session save failed");
+                        return 1;
                     };
                     ci = ci + 1;
                 }
             },
             MiniEventKind::TurnDone => {
+                if session_bump(session_id, seq) != true {
+                    println("scodex-mini: session save failed");
+                    return 1;
+                };
                 return 0;
             },
         };
         turn = turn + 1;
     }
+    if session_bump(session_id, seq) != true {
+        println("scodex-mini: session save failed");
+        return 1;
+    };
     return 0;
 }
 
@@ -305,4 +434,457 @@ fn mini_model_run_turn(cfg: MiniConfig, prompt_ptr: ptr, prompt_len: u64) -> i32
     if u.text_len != 2 { panic(501); };
     let f = mini_input_func_output(STR_PTR("c1"), STR_LEN("c1"), STR_PTR("ok"), STR_LEN("ok"));
     if f.call_id_len != 2 { panic(502); };
+}
+// ---- Session persistence (DB-backed) ----
+// DB root: $HOME/.scodex-mini/db
+
+struct DbTableInfo {
+    row_count: u64,
+    segment_count: u64,
+    epoch: u64,
+    locked: u64,
+}
+
+struct DbSnapshotInfo {
+    row_count: u64,
+    column_count: u64,
+    row_bytes: u64,
+    epoch: u64,
+}
+
+struct SessionRow {
+    id: u64,
+    created_ms: u64,
+    updated_ms: u64,
+    msg_count: u64,
+    title_blob: u64,
+}
+
+struct MessageRow {
+    session_id: u64,
+    seq: u64,
+    role: u64,
+    body_blob: u64,
+}
+
+fn session_db_sessions_schema() -> (ptr, u64) {
+    // Workaround: STR_LEN miscompiles the length of this literal (toolchain
+    // bug); length is hardcoded. DDL text is fixed, 210 bytes with \n = 1 byte.
+    let p = STR_PTR("#def MAX_ROWS = 1024\n#def COL_ID_STRIDE = 8 // u64\n#def COL_CREATED_MS_STRIDE = 8 // u64\n#def COL_UPDATED_MS_STRIDE = 8 // u64\n#def COL_MSG_COUNT_STRIDE = 8 // u64\n#def COL_TITLE_BLOB_STRIDE = 8 // blob_handle\n");
+    let l: u64 = 210;
+    return (p, l);
+}
+
+fn session_db_messages_schema() -> (ptr, u64) {
+    let p = STR_PTR("#def MAX_ROWS = 65536\n#def COL_SESSION_ID_STRIDE = 8 // u64\n#def COL_SEQ_STRIDE = 8 // u64\n#def COL_ROLE_STRIDE = 8 // u64\n#def COL_BODY_BLOB_STRIDE = 8 // blob_handle\n");
+    let l: u64 = 168;
+    return (p, l);
+}
+
+fn session_db_root() -> (ptr, u64) {
+    let rp = X_DB_ROOT_PTR();
+    let rl = X_DB_ROOT_LEN();
+    return (rp, rl);
+}
+
+fn session_db_table_exists(root: ptr, root_len: u64, tptr: ptr, tlen: u64) -> bool {
+    let h: ptr = PTR_NULL();
+    let st = sa_db_open_read_table(root, root_len, tptr, tlen, &h);
+    if st != 0 {
+        return false;
+    };
+    sa_db_close_read_table(h);
+    return true;
+}
+
+fn session_db_ensure() -> bool {
+    let (root, root_len) = session_db_root();
+    let sn = STR_PTR("sessions");
+    let snl = STR_LEN("sessions");
+    if session_db_table_exists(root, root_len, sn, snl) != true {
+        let info = DbTableInfo { row_count: 0, segment_count: 0, epoch: 0, locked: 0 };
+        let (sp, sl) = session_db_sessions_schema();
+        let st = sa_db_init_schema(root, root_len,
+            STR_PTR("sessions.sadb-schema"), STR_LEN("sessions.sadb-schema"),
+            sp, sl, &info);
+        if st != 0 {
+            println("scodex-mini: db init failed (sessions)");
+            return false;
+        };
+    };
+    let mn = STR_PTR("messages");
+    let mnl = STR_LEN("messages");
+    if session_db_table_exists(root, root_len, mn, mnl) != true {
+        let minfo = DbTableInfo { row_count: 0, segment_count: 0, epoch: 0, locked: 0 };
+        let (mp, ml) = session_db_messages_schema();
+        let mst = sa_db_init_schema(root, root_len,
+            STR_PTR("messages.sadb-schema"), STR_LEN("messages.sadb-schema"),
+            mp, ml, &minfo);
+        if mst != 0 {
+            println("scodex-mini: db init failed (messages)");
+            return false;
+        };
+    };
+    let ci = DbTableInfo { row_count: 0, segment_count: 0, epoch: 0, locked: 0 };
+    let cst = sa_db_create_u64_pair_index(root, root_len, mn, mnl, 0, 1, 0, &ci);
+    if cst != 0 {
+        println("scodex-mini: db init failed (index)");
+        return false;
+    };
+    // sessions(id) u64 index: required for get_row_u64_key/upsert_row_u64_key (else err 2).
+    let si2 = DbTableInfo { row_count: 0, segment_count: 0, epoch: 0, locked: 0 };
+    let sst = sa_db_create_u64_index(root, root_len, sn, snl, 0, 1, &si2);
+    if sst != 0 {
+        println("scodex-mini: db init failed (sessions idx)");
+        return false;
+    };
+    return true;
+}
+
+fn session_create(title_ptr: ptr, title_len: u64) -> u64 {
+    let (root, root_len) = session_db_root();
+    var tlen: u64;
+    tlen = title_len;
+    if tlen > 40 {
+        tlen = 40;
+    };
+    let blob_id: u64 = 0;
+    let binfo = DbTableInfo { row_count: 0, segment_count: 0, epoch: 0, locked: 0 };
+    let bst = sa_db_blob_put(root, root_len,
+        STR_PTR("sessions"), STR_LEN("sessions"),
+        STR_PTR("texts"), STR_LEN("texts"),
+        title_ptr, tlen, &blob_id, &binfo);
+    if bst != 0 {
+        println("scodex-mini: session save failed");
+        return 0;
+    };
+    let h: ptr = PTR_NULL();
+    let ost = sa_db_open_read_table(root, root_len, STR_PTR("sessions"), STR_LEN("sessions"), &h);
+    if ost != 0 {
+        println("scodex-mini: session save failed");
+        return 0;
+    };
+    let mx: u64 = 0;
+    let xst = sa_db_max_u64_handle(h, 0, &mx);
+    sa_db_close_read_table(h);
+    if xst != 0 {
+        println("scodex-mini: session save failed");
+        return 0;
+    };
+    let new_id = mx + 1;
+    let now_ms = sa_time_unix_ms();
+    let now_u: u64 = now_ms as u64;
+    let srow = SessionRow { id: new_id, created_ms: now_u, updated_ms: now_u, msg_count: 0, title_blob: blob_id };
+    let iinfo = DbTableInfo { row_count: 0, segment_count: 0, epoch: 0, locked: 0 };
+    let ist = sa_db_insert_row(root, root_len, STR_PTR("sessions"), STR_LEN("sessions"), &srow, 40, &iinfo);
+    if ist != 0 {
+        println("scodex-mini: session save failed");
+        return 0;
+    };
+    return new_id;
+}
+
+fn session_add_message(session_id: u64, seq: u64, role: u64, body_ptr: ptr, body_len: u64) -> bool {
+    let (root, root_len) = session_db_root();
+    let blob_id: u64 = 0;
+    let binfo = DbTableInfo { row_count: 0, segment_count: 0, epoch: 0, locked: 0 };
+    let bst = sa_db_blob_put(root, root_len,
+        STR_PTR("messages"), STR_LEN("messages"),
+        STR_PTR("texts"), STR_LEN("texts"),
+        body_ptr, body_len, &blob_id, &binfo);
+    if bst != 0 {
+        println("scodex-mini: session save failed");
+        return false;
+    };
+    let mrow = MessageRow { session_id: session_id, seq: seq, role: role, body_blob: blob_id };
+    let iinfo = DbTableInfo { row_count: 0, segment_count: 0, epoch: 0, locked: 0 };
+    let ist = sa_db_insert_row(root, root_len, STR_PTR("messages"), STR_LEN("messages"), &mrow, 32, &iinfo);
+    if ist != 0 {
+        println("scodex-mini: session save failed");
+        return false;
+    };
+    // Keep the sessions row's msg_count in sync (needed for --list).
+    if session_bump(session_id, seq + 1) != true {
+        return false;
+    };
+    return true;
+}
+
+fn session_bump(session_id: u64, msg_count: u64) -> bool {
+    let (root, root_len) = session_db_root();
+    let h: ptr = PTR_NULL();
+    let ost = sa_db_open_read_table(root, root_len, STR_PTR("sessions"), STR_LEN("sessions"), &h);
+    if ost != 0 {
+        println("scodex-mini: session save failed");
+        return false;
+    };
+    let row = SessionRow { id: 0, created_ms: 0, updated_ms: 0, msg_count: 0, title_blob: 0 };
+    let gst = sa_db_get_row_u64_key_handle(h, 0, session_id, &row, 40);
+    sa_db_close_read_table(h);
+    if gst != 0 {
+        println("scodex-mini: session save failed");
+        return false;
+    };
+    let now_ms = sa_time_unix_ms();
+    let now_u: u64 = now_ms as u64;
+    let newrow = SessionRow { id: row.id, created_ms: row.created_ms, updated_ms: now_u, msg_count: msg_count, title_blob: row.title_blob };
+    let inserted: u64 = 0;
+    let uinfo = DbTableInfo { row_count: 0, segment_count: 0, epoch: 0, locked: 0 };
+    let ust = sa_db_upsert_row_u64_key(root, root_len,
+        STR_PTR("sessions"), STR_LEN("sessions"),
+        0, session_id, &newrow, 40, &inserted, &uinfo);
+    if ust != 0 {
+        println("scodex-mini: session save failed");
+        return false;
+    };
+    return true;
+}
+
+
+// Lists all sessions: one `session id={} msgs={} updated_ms={}` line plus the
+// title line per session. Does not require an API key.
+fn session_list() -> i32 {
+    if session_db_ensure() != true {
+        return 1;
+    };
+    let (root, root_len) = session_db_root();
+    let h: ptr = PTR_NULL();
+    let ost = sa_db_open_read_table(root, root_len, STR_PTR("sessions"), STR_LEN("sessions"), &h);
+    if ost != 0 {
+        println("scodex-mini: session db error");
+        return 1;
+    };
+    let sinfo = DbSnapshotInfo { row_count: 0, column_count: 0, row_bytes: 0, epoch: 0 };
+    let sst = sa_db_snapshot_info_handle(h, &sinfo);
+    if sst != 0 {
+        println("scodex-mini: session db error");
+        sa_db_close_read_table(h);
+        return 1;
+    };
+    if sinfo.row_count == 0 {
+        println("scodex-mini: no sessions");
+        sa_db_close_read_table(h);
+        return 0;
+    };
+    let store = STR_PTR("texts");
+    let store_len = STR_LEN("texts");
+    let i: u64 = 0;
+    while i < sinfo.row_count {
+        let srow = SessionRow { id: 0, created_ms: 0, updated_ms: 0, msg_count: 0, title_blob: 0 };
+        let gst = sa_db_get_row_handle(h, i, &srow, 40);
+        if gst != 0 {
+            println("scodex-mini: session db error");
+            sa_db_close_read_table(h);
+            return 1;
+        };
+        println("session id={} msgs={} updated_ms={}", srow.id, srow.msg_count, srow.updated_ms);
+        let found: u64 = 0;
+        let blen: u64 = 0;
+        let blst = sa_db_blob_value_len_handle(h, store, store_len, srow.title_blob, &found, &blen);
+        if blst == 0 {
+            if found == 1 {
+                if blen > 0 {
+                    let bbuf = X_HEAP_BUF_PTR(blen);
+                    let found2: u64 = 0;
+                    let written: u64 = 0;
+                    let bcst = sa_db_blob_value_copy_handle(h, store, store_len, srow.title_blob, bbuf, blen, &found2, &written);
+                    if bcst == 0 {
+                        sa_print_bytes(bbuf, written);
+                    };
+                };
+            };
+        };
+        println("");
+        i = i + 1;
+    }
+    sa_db_close_read_table(h);
+    return 0;
+}
+
+// Loads a session's message history into a fresh items vec for --resume.
+// Returns (status, next_seq, items). status 0 = ok. Corrupt records are
+// never silently skipped: they print an error and return status 1.
+// NOTE: the vec is created and returned here (not taken as a param) because
+// Vec values are passed by value in .sla — pushes inside a callee are not
+// visible to the caller (verified with a @test probe).
+fn session_resume_load(session_id: u64) -> (u64, u64, Vec<MiniInputItem>) {
+    let empty: Vec<MiniInputItem> = Vec::new();
+    if session_db_ensure() != true {
+        return (1, 0, empty);
+    };
+    let (root, root_len) = session_db_root();
+    let h: ptr = PTR_NULL();
+    let ost = sa_db_open_read_table(root, root_len, STR_PTR("sessions"), STR_LEN("sessions"), &h);
+    if ost != 0 {
+        println("scodex-mini: session db error");
+        return (1, 0, empty);
+    };
+    let srow = SessionRow { id: 0, created_ms: 0, updated_ms: 0, msg_count: 0, title_blob: 0 };
+    let gst = sa_db_get_row_u64_key_handle(h, 0, session_id, &srow, 40);
+    sa_db_close_read_table(h);
+    if gst != 0 {
+        println("scodex-mini: session {} not found", session_id);
+        return (1, 0, empty);
+    };
+    let mh: ptr = PTR_NULL();
+    let ost2 = sa_db_open_read_table(root, root_len, STR_PTR("messages"), STR_LEN("messages"), &mh);
+    if ost2 != 0 {
+        println("scodex-mini: session db error");
+        return (1, 0, empty);
+    };
+    // Probe with limit=0 to learn the total match count first.
+    let probe: u64 = 0;
+    let w: u64 = 0;
+    let total: u64 = 0;
+    let fst = sa_db_filter_u64_pair_key1_handle(mh, 0, 1, session_id, 0, 0, &probe, 1, &w, &total);
+    if fst != 0 {
+        println("scodex-mini: session db error");
+        sa_db_close_read_table(mh);
+        return (1, 0, empty);
+    };
+    let items: Vec<MiniInputItem> = Vec::new();
+    if total == 0 {
+        sa_db_close_read_table(mh);
+        return (0, 0, items);
+    };
+    let rows_ptr = X_HEAP_BUF_PTR(total * 8);
+    let w2: u64 = 0;
+    let total2: u64 = 0;
+    let fst2 = sa_db_filter_u64_pair_key1_handle(mh, 0, 1, session_id, 0, total, rows_ptr, total, &w2, &total2);
+    if fst2 != 0 {
+        println("scodex-mini: session db error");
+        sa_db_close_read_table(mh);
+        return (1, 0, empty);
+    };
+    let store = STR_PTR("texts");
+    let store_len = STR_LEN("texts");
+    let ck = STR_PTR("call_id");
+    let ckl = STR_LEN("call_id");
+    let nk = STR_PTR("name");
+    let nkl = STR_LEN("name");
+    let ak = STR_PTR("args");
+    let akl = STR_LEN("args");
+    let ok = STR_PTR("output");
+    let okl = STR_LEN("output");
+    var next_seq: u64;
+    next_seq = 0;
+    let i: u64 = 0;
+    while i < total {
+        let ri = X_ROW_GET_U64(rows_ptr, i);
+        let mrow = MessageRow { session_id: 0, seq: 0, role: 0, body_blob: 0 };
+        let grst = sa_db_get_row_handle(mh, ri, &mrow, 32);
+        if grst != 0 {
+            println("scodex-mini: session db error");
+            sa_db_close_read_table(mh);
+            return (1, 0, empty);
+        };
+        let seq = mrow.seq;
+        let role = mrow.role;
+        if seq + 1 > next_seq {
+            next_seq = seq + 1;
+        };
+        let found: u64 = 0;
+        let blen: u64 = 0;
+        let blst = sa_db_blob_value_len_handle(mh, store, store_len, mrow.body_blob, &found, &blen);
+        if blst != 0 {
+            println("scodex-mini: session db error");
+            sa_db_close_read_table(mh);
+            return (1, 0, empty);
+        };
+        if found != 1 {
+            println("scodex-mini: session db error");
+            sa_db_close_read_table(mh);
+            return (1, 0, empty);
+        };
+        let bbuf: ptr = PTR_NULL();
+        if blen > 0 {
+            bbuf = X_HEAP_BUF_PTR(blen);
+            let found2: u64 = 0;
+            let written: u64 = 0;
+            let bcst = sa_db_blob_value_copy_handle(mh, store, store_len, mrow.body_blob, bbuf, blen, &found2, &written);
+            if bcst != 0 {
+                println("scodex-mini: session db error");
+                sa_db_close_read_table(mh);
+                return (1, 0, empty);
+            };
+        };
+        if role == 0 {
+            items.push(mini_input_user(bbuf, blen));
+        } else {
+            if role == 1 {
+                items.push(mini_input_assistant(bbuf, blen));
+            } else {
+                if role == 2 {
+                    let broot = JSON_PARSE(bbuf, blen);
+                    let ok2 = false;
+                    if broot != PTR_NULL() {
+                        if X_OBJ_HAS(broot, ck, ckl) == true {
+                            if X_OBJ_HAS(broot, nk, nkl) == true {
+                                if X_OBJ_HAS(broot, ak, akl) == true {
+                                    let cidp = X_OBJ_STR_PTR(broot, ck, ckl);
+                                    let cidl = X_OBJ_STR_LEN(broot, ck, ckl);
+                                    let nmp = X_OBJ_STR_PTR(broot, nk, nkl);
+                                    let nml = X_OBJ_STR_LEN(broot, nk, nkl);
+                                    let agp = X_OBJ_STR_PTR(broot, ak, akl);
+                                    let agl = X_OBJ_STR_LEN(broot, ak, akl);
+                                    if cidp != PTR_NULL() {
+                                        if nmp != PTR_NULL() {
+                                            if agp != PTR_NULL() {
+                                                if cidl > 0 {
+                                                    if nml > 0 {
+                                                        items.push(mini_input_func_call(cidp, cidl, nmp, nml, agp, agl));
+                                                        ok2 = true;
+                                                    };
+                                                };
+                                            };
+                                        };
+                                    };
+                                };
+                            };
+                        };
+                    };
+                    if ok2 != true {
+                        println("scodex-mini: corrupt function_call record (session {} seq {})", session_id, seq);
+                        sa_db_close_read_table(mh);
+                        return (1, 0, empty);
+                    };
+                } else {
+                    if role == 3 {
+                        let broot3 = JSON_PARSE(bbuf, blen);
+                        let ok3 = false;
+                        if broot3 != PTR_NULL() {
+                            if X_OBJ_HAS(broot3, ck, ckl) == true {
+                                if X_OBJ_HAS(broot3, ok, okl) == true {
+                                    let cidp3 = X_OBJ_STR_PTR(broot3, ck, ckl);
+                                    let cidl3 = X_OBJ_STR_LEN(broot3, ck, ckl);
+                                    let outp = X_OBJ_STR_PTR(broot3, ok, okl);
+                                    let outl = X_OBJ_STR_LEN(broot3, ok, okl);
+                                    if cidp3 != PTR_NULL() {
+                                        if outp != PTR_NULL() {
+                                            if cidl3 > 0 {
+                                                items.push(mini_input_func_output(cidp3, cidl3, outp, outl));
+                                                ok3 = true;
+                                            };
+                                        };
+                                    };
+                                };
+                            };
+                        };
+                        if ok3 != true {
+                            println("scodex-mini: corrupt function_call_output record (session {} seq {})", session_id, seq);
+                            sa_db_close_read_table(mh);
+                            return (1, 0, empty);
+                        };
+                    } else {
+                        println("scodex-mini: corrupt message role (session {} seq {})", session_id, seq);
+                        sa_db_close_read_table(mh);
+                        return (1, 0, empty);
+                    };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    sa_db_close_read_table(mh);
+    return (0, next_seq, items);
 }

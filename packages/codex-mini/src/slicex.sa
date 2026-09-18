@@ -128,8 +128,14 @@ L_XCB_END:
 [END_MACRO]
 
 // X_PTR_ADD: out = ptr + offset (single output)
-[MACRO] X_PTR_ADD %out_ptr, %base_ptr, %offset
-    %out_ptr = ptr_add %base_ptr, %offset
+// NOTE: the offset is copied through a temp first — ptr_add with a raw
+// macro parameter as the offset fails SAB lowering ("cannot resolve type
+// of argument 0"); all proven macros (X_STR_EQ, X_ROW_GET_U64, X_COPY_BYTES)
+// use ptr_add only with a computed temp (2026-09-18).
+[MACRO] X_PTR_ADD %out, %base, %off
+    __xpa_off_%out = mul %off, 1
+    %out = ptr_add %base, __xpa_off_%out
+    !__xpa_off_%out
 [END_MACRO]
 
 // Joins argv[1..n] with single spaces. root is the JSON array, n is count.
