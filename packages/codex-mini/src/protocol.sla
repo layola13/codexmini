@@ -1,0 +1,53 @@
+@import "sa_std/ptr.sa"
+@import "sa_std/vec.sa"
+
+enum MiniEventKind {
+    TextDelta,
+    ToolCall,
+    TurnDone,
+    Failed,
+}
+
+struct MiniToolCall {
+    call_id_ptr: ptr,
+    call_id_len: u64,
+    name_ptr: ptr,
+    name_len: u64,
+    args_ptr: ptr,
+    args_len: u64,
+}
+
+struct MiniTurnOutcome {
+    kind: MiniEventKind,
+    text_ptr: ptr,
+    text_len: u64,
+    calls: Vec<MiniToolCall>,
+    error_code: u64,
+}
+
+fn mini_tool_call_empty() -> MiniToolCall {
+    return MiniToolCall {
+        call_id_ptr: PTR_NULL(),
+        call_id_len: 0,
+        name_ptr: PTR_NULL(),
+        name_len: 0,
+        args_ptr: PTR_NULL(),
+        args_len: 0,
+    };
+}
+
+fn mini_turn_outcome_failed(code: u64) -> MiniTurnOutcome {
+    return MiniTurnOutcome {
+        kind: MiniEventKind::Failed,
+        text_ptr: PTR_NULL(),
+        text_len: 0,
+        calls: Vec::new(),
+        error_code: code,
+    };
+}
+
+@test "protocol tool call default is empty"() {
+    let c = mini_tool_call_empty();
+    if c.call_id_len != 0 { panic(201); };
+    if c.args_len != 0 { panic(202); };
+}

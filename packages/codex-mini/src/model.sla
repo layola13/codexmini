@@ -1,0 +1,308 @@
+@import "sa_std/encoding/json.sai"
+@import "sa_std/encoding/json.sa"
+@import "jsonx.sa"
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/vec.sa"
+@import "slicex.sa"
+@import "sa_std/core/slice.sa"
+@import "sa_std/io/print.sai"
+@import "config.sla"
+@import "protocol.sla"
+@import "http.sla"
+@import "tools.sla"
+
+enum MiniInputKind {
+    UserText,
+    FuncOutput,
+}
+
+struct MiniInputItem {
+    kind: MiniInputKind,
+    text_ptr: ptr,
+    text_len: u64,
+    call_id_ptr: ptr,
+    call_id_len: u64,
+}
+
+fn mini_input_user(text_ptr: ptr, text_len: u64) -> MiniInputItem {
+    return MiniInputItem {
+        kind: MiniInputKind::UserText,
+        text_ptr: text_ptr,
+        text_len: text_len,
+        call_id_ptr: PTR_NULL(),
+        call_id_len: 0,
+    };
+}
+
+fn mini_input_func_output(call_id_ptr: ptr, call_id_len: u64, out_ptr: ptr, out_len: u64) -> MiniInputItem {
+    return MiniInputItem {
+        kind: MiniInputKind::FuncOutput,
+        text_ptr: out_ptr,
+        text_len: out_len,
+        call_id_ptr: call_id_ptr,
+        call_id_len: call_id_len,
+    };
+}
+
+fn mini_model_str_eq(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> bool {
+    return X_STR_EQ(a_ptr, a_len, b_ptr, b_len);
+}
+
+// Builds the /v1/responses request JSON. Returns (body_ptr, body_len, json_buf);
+// the caller must keep json_buf alive while using the body, then free it with
+// sa_json_buffer_free.
+fn mini_model_build_request(cfg: MiniConfig, items: Vec<MiniInputItem>) -> ptr {
+    let w: ptr = PTR_NULL();
+    sa_json_writer_new(0, 1, 0, 0, 0, &w);
+    sa_json_writer_begin_object(w);
+    sa_json_writer_field_string(w, STR_PTR("model"), STR_LEN("model"), STR_PTR("gpt-5"), STR_LEN("gpt-5"));
+    sa_json_writer_object_field(w, STR_PTR("input"), STR_LEN("input"));
+    sa_json_writer_begin_array(w);
+    let n: u64 = items.len();
+    let i: u64 = 0;
+    while i < n {
+        let item = items[i];
+        sa_json_writer_begin_object(w);
+        match item.kind {
+            MiniInputKind::UserText => {
+                sa_json_writer_field_string(w, STR_PTR("role"), STR_LEN("role"), STR_PTR("user"), STR_LEN("user"));
+                sa_json_writer_object_field(w, STR_PTR("content"), STR_LEN("content"));
+                sa_json_writer_begin_array(w);
+                sa_json_writer_begin_object(w);
+                sa_json_writer_field_string(w, STR_PTR("type"), STR_LEN("type"), STR_PTR("input_text"), STR_LEN("input_text"));
+                sa_json_writer_field_string(w, STR_PTR("text"), STR_LEN("text"), item.text_ptr, item.text_len);
+                sa_json_writer_end_object(w);
+                sa_json_writer_end_array(w);
+            },
+            MiniInputKind::FuncOutput => {
+                sa_json_writer_field_string(w, STR_PTR("type"), STR_LEN("type"), STR_PTR("function_call_output"), STR_LEN("function_call_output"));
+                sa_json_writer_field_string(w, STR_PTR("call_id"), STR_LEN("call_id"), item.call_id_ptr, item.call_id_len);
+                sa_json_writer_field_string(w, STR_PTR("output"), STR_LEN("output"), item.text_ptr, item.text_len);
+            },
+        };
+        sa_json_writer_end_object(w);
+        i = i + 1;
+    }
+    sa_json_writer_end_array(w);
+    sa_json_writer_object_field(w, STR_PTR("tools"), STR_LEN("tools"));
+    sa_json_writer_begin_array(w);
+    sa_json_writer_begin_object(w);
+    sa_json_writer_field_string(w, STR_PTR("type"), STR_LEN("type"), STR_PTR("function"), STR_LEN("function"));
+    sa_json_writer_field_string(w, STR_PTR("name"), STR_LEN("name"), STR_PTR("shell_exec"), STR_LEN("shell_exec"));
+    sa_json_writer_field_string(w, STR_PTR("description"), STR_LEN("description"), STR_PTR("Run a shell command via sh -c and return its stdout."), STR_LEN("Run a shell command via sh -c and return its stdout."));
+    sa_json_writer_object_field(w, STR_PTR("parameters"), STR_LEN("parameters"));
+    sa_json_writer_begin_object(w);
+    sa_json_writer_field_string(w, STR_PTR("type"), STR_LEN("type"), STR_PTR("object"), STR_LEN("object"));
+    sa_json_writer_object_field(w, STR_PTR("properties"), STR_LEN("properties"));
+    sa_json_writer_begin_object(w);
+    sa_json_writer_object_field(w, STR_PTR("command"), STR_LEN("command"));
+    sa_json_writer_begin_object(w);
+    sa_json_writer_field_string(w, STR_PTR("type"), STR_LEN("type"), STR_PTR("string"), STR_LEN("string"));
+    sa_json_writer_field_string(w, STR_PTR("description"), STR_LEN("description"), STR_PTR("Shell command to run."), STR_LEN("Shell command to run."));
+    sa_json_writer_end_object(w);
+    sa_json_writer_end_object(w);
+    sa_json_writer_object_field(w, STR_PTR("required"), STR_LEN("required"));
+    sa_json_writer_begin_array(w);
+    sa_json_writer_write_string(w, STR_PTR("command"), STR_LEN("command"));
+    sa_json_writer_end_array(w);
+    sa_json_writer_end_object(w);
+    sa_json_writer_end_object(w);
+    sa_json_writer_end_array(w);
+    sa_json_writer_end_object(w);
+    let buf = sa_json_writer_finish_buffer(w);
+    sa_json_writer_free(w);
+    return buf;
+}
+
+fn mini_model_build_url(cfg: MiniConfig) -> (ptr, u64) {
+    // Minimal: use default URL. Custom base_url support needs heap alloc.
+    let url_ptr = STR_PTR("https://api.openai.com/v1/responses");
+    let url_len = STR_LEN("https://api.openai.com/v1/responses");
+    return (url_ptr, url_len);
+}
+
+// Parses a non-streaming /v1/responses JSON body into a turn outcome.
+fn mini_model_parse_response(body_ptr: ptr, body_len: u64) -> MiniTurnOutcome {
+    let outcome = mini_turn_outcome_failed(5001);
+    let root = JSON_PARSE(body_ptr, body_len);
+    if root == PTR_NULL() {
+        return outcome;
+    };
+    let okey = STR_PTR("output");
+    let okey_len = STR_LEN("output");
+    if X_OBJ_HAS(root, okey, okey_len) != true {
+        outcome.error_code = 5002;
+        return outcome;
+    };
+    let output_slot: ptr = PTR_NULL();
+    if sa_json_object_get(root, okey, okey_len, &output_slot) != 0 {
+        outcome.error_code = 5002;
+        return outcome;
+    };
+    let output = output_slot;
+    let cnt_slot: u64 = 0;
+    if sa_json_value_count(output, &cnt_slot) != 0 {
+        outcome.error_code = 5003;
+        return outcome;
+    };
+    let n = cnt_slot;
+    let i: u64 = 0;
+    while i < n {
+        let item_slot: ptr = PTR_NULL();
+        if sa_json_array_get(output, i, &item_slot) == 0 {
+            let item = item_slot;
+            let tkey = STR_PTR("type");
+            let tkey_len = STR_LEN("type");
+            if X_OBJ_HAS(item, tkey, tkey_len) == true {
+                let tptr = X_OBJ_STR_PTR(item, tkey, tkey_len);
+                let tlen = X_OBJ_STR_LEN(item, tkey, tkey_len);
+                if mini_model_str_eq(tptr, tlen, STR_PTR("message"), STR_LEN("message")) {
+                    let ckey = STR_PTR("content");
+                    let ckey_len = STR_LEN("content");
+                    if X_OBJ_HAS(item, ckey, ckey_len) == true {
+                        let cslot: ptr = PTR_NULL();
+                        if sa_json_object_get(item, ckey, ckey_len, &cslot) == 0 {
+                            let c0slot: ptr = PTR_NULL();
+                            if sa_json_array_get(cslot, 0, &c0slot) == 0 {
+                                let txkey = STR_PTR("text");
+                                let txkey_len = STR_LEN("text");
+                                if X_OBJ_HAS(c0slot, txkey, txkey_len) == true {
+                                    outcome.kind = MiniEventKind::TextDelta;
+                                    outcome.text_ptr = X_OBJ_STR_PTR(c0slot, txkey, txkey_len);
+                                    outcome.text_len = X_OBJ_STR_LEN(c0slot, txkey, txkey_len);
+                                };
+                            };
+                        };
+                    };
+                };
+                if mini_model_str_eq(tptr, tlen, STR_PTR("function_call"), STR_LEN("function_call")) {
+                    let idkey = STR_PTR("call_id");
+                    let idkey_len = STR_LEN("call_id");
+                    let nmkey = STR_PTR("name");
+                    let nmkey_len = STR_LEN("name");
+                    let agkey = STR_PTR("arguments");
+                    let agkey_len = STR_LEN("arguments");
+                    if X_OBJ_HAS(item, idkey, idkey_len) == true {
+                        if X_OBJ_HAS(item, nmkey, nmkey_len) == true {
+                            if X_OBJ_HAS(item, agkey, agkey_len) == true {
+                                let call = mini_tool_call_empty();
+                                call.call_id_ptr = X_OBJ_STR_PTR(item, idkey, idkey_len);
+                                call.call_id_len = X_OBJ_STR_LEN(item, idkey, idkey_len);
+                                call.name_ptr = X_OBJ_STR_PTR(item, nmkey, nmkey_len);
+                                call.name_len = X_OBJ_STR_LEN(item, nmkey, nmkey_len);
+                                call.args_ptr = X_OBJ_STR_PTR(item, agkey, agkey_len);
+                                call.args_len = X_OBJ_STR_LEN(item, agkey, agkey_len);
+                                outcome.calls.push(call);
+                                outcome.kind = MiniEventKind::ToolCall;
+                            };
+                        };
+                    };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    match outcome.kind {
+        MiniEventKind::Failed => {
+            outcome.kind = MiniEventKind::TurnDone;
+            outcome.error_code = 0;
+        },
+        MiniEventKind::TextDelta => {},
+        MiniEventKind::ToolCall => {},
+        MiniEventKind::TurnDone => {},
+    };
+    return outcome;
+}
+
+
+// Extracts the "command" argument from a function_call arguments JSON object.
+fn mini_model_tool_command(args_ptr: ptr, args_len: u64) -> (ptr, u64, bool) {
+    let root = JSON_PARSE(args_ptr, args_len);
+    if root == PTR_NULL() {
+        return (PTR_NULL(), 0, false);
+    };
+    let ckey = STR_PTR("command");
+    let ckey_len = STR_LEN("command");
+    if X_OBJ_HAS(root, ckey, ckey_len) != true {
+        return (PTR_NULL(), 0, false);
+    };
+    let cptr = X_OBJ_STR_PTR(root, ckey, ckey_len);
+    let clen = X_OBJ_STR_LEN(root, ckey, ckey_len);
+    return (cptr, clen, true);
+}
+
+// Single-turn agent loop: prompt -> model -> (tool calls -> exec -> model)* -> done.
+// Mirrors the Rust codex-min single-turn behavior.
+fn mini_model_run_turn(cfg: MiniConfig, prompt_ptr: ptr, prompt_len: u64) -> i32 {
+    let (url_ptr, url_len) = mini_model_build_url(cfg);
+    let items: Vec<MiniInputItem> = Vec::new();
+    items.push(mini_input_user(prompt_ptr, prompt_len));
+    let turn: u64 = 0;
+    while turn < cfg.max_turns {
+        let json_buf = mini_model_build_request(cfg, items);
+        if json_buf == PTR_NULL() {
+            println("scodex-mini: failed to build request");
+            return 1;
+        };
+        let body_ref = sa_json_buffer_data(json_buf);
+        let body_ptr: ptr = body_ref;
+        let body_len = sa_json_buffer_len(json_buf);
+        let resp = mini_http_post_json(url_ptr, url_len, body_ptr, body_len, cfg.api_key_ptr, cfg.api_key_len);
+        if resp.ok != true {
+            println("scodex-mini: http request failed");
+            return 1;
+        };
+        if resp.status != 200 {
+            println("scodex-mini: http status={}", resp.status);
+            return 1;
+        };
+        let outcome = mini_model_parse_response(resp.body_ptr, resp.body_len);
+        match outcome.kind {
+            MiniEventKind::Failed => {
+                println("scodex-mini: response parse failed code={}", outcome.error_code);
+                return 1;
+            },
+            MiniEventKind::TextDelta => {
+                sa_print_bytes(outcome.text_ptr, outcome.text_len);
+                println("");
+                return 0;
+            },
+            MiniEventKind::ToolCall => {
+                let ncalls = outcome.calls.len();
+                let ci: u64 = 0;
+                while ci < ncalls {
+                    let call = outcome.calls[ci];
+                    if mini_model_str_eq(call.name_ptr, call.name_len, STR_PTR("shell_exec"), STR_LEN("shell_exec")) {
+                        let (cmd_ptr, cmd_len, cmd_ok) = mini_model_tool_command(call.args_ptr, call.args_len);
+                        if cmd_ok == true {
+                            let exec = mini_shell_exec(cmd_ptr, cmd_len);
+                            if exec.ok == true {
+                                items.push(mini_input_func_output(call.call_id_ptr, call.call_id_len, exec.out_ptr, exec.out_len));
+                            } else {
+                                items.push(mini_input_func_output(call.call_id_ptr, call.call_id_len, STR_PTR("(exec failed)"), STR_LEN("(exec failed)")));
+                            };
+                        } else {
+                            items.push(mini_input_func_output(call.call_id_ptr, call.call_id_len, STR_PTR("(bad arguments)"), STR_LEN("(bad arguments)")));
+                        };
+                    } else {
+                        items.push(mini_input_func_output(call.call_id_ptr, call.call_id_len, STR_PTR("(unknown tool)"), STR_LEN("(unknown tool)")));
+                    };
+                    ci = ci + 1;
+                }
+            },
+            MiniEventKind::TurnDone => {
+                return 0;
+            },
+        };
+        turn = turn + 1;
+    }
+    return 0;
+}
+
+@test "model input item constructors"() {
+    let u = mini_input_user(STR_PTR("hi"), STR_LEN("hi"));
+    if u.text_len != 2 { panic(501); };
+    let f = mini_input_func_output(STR_PTR("c1"), STR_LEN("c1"), STR_PTR("ok"), STR_LEN("ok"));
+    if f.call_id_len != 2 { panic(502); };
+}

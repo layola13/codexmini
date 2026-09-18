@@ -1,0 +1,66 @@
+@import "sa_std/string.sa"
+
+// Single-output slice constructor for .sla expression use.
+// (The std SLICE_NEW macro names its out param %slice_reg, which the SLA
+// importer does not count as a leading output, so it cannot be used as an
+// expression.)
+
+[MACRO] X_SLICE %out_slice, %data_ptr, %length
+    store %out_slice+Slice_ptr, %data_ptr as ptr
+    store %out_slice+Slice_len, %length as u64
+[END_MACRO]
+
+// Pushes a (ptr, len) byte string into a StringBuf without creating a
+// let-bound slice value (which the .sla codegen cannot pass to macros).
+[MACRO] X_PUSH_PTR_LEN %buf, %sptr, %slen
+    __x_push_slice_%buf = slice_new %sptr, %slen
+    EXPAND STRING_BUF_PUSH_STR %buf, __x_push_slice_%buf
+    !__x_push_slice_%buf
+[END_MACRO]
+
+// Byte-wise equality on (ptr, len) pairs. Avoids the .sla codegen issue where
+// a let-bound slice value passed to STR_EQ loses its type.
+[MACRO] X_STR_EQ %out_bool, %a_ptr, %a_len, %b_ptr, %b_len
+    same_len_%out_bool = eq %a_len, %b_len
+    idx_slot_%out_bool = stack_alloc 8
+    store idx_slot_%out_bool+0, 0 as u64
+    br same_len_%out_bool -> L_XSEQ_HEAD_%out_bool, L_XSEQ_NE_%out_bool
+L_XSEQ_LOOP_%out_bool:
+    jmp L_XSEQ_HEAD_%out_bool
+L_XSEQ_HEAD_%out_bool:
+    idx_%out_bool = load idx_slot_%out_bool+0 as u64
+    done_%out_bool = eq idx_%out_bool, %a_len
+    br done_%out_bool -> L_XSEQ_TRUE_%out_bool, L_XSEQ_BODY_%out_bool
+L_XSEQ_BODY_%out_bool:
+    a_ip_%out_bool = ptr_add %a_ptr, idx_%out_bool
+    b_ip_%out_bool = ptr_add %b_ptr, idx_%out_bool
+    a_byte_%out_bool = load a_ip_%out_bool+0 as u8
+    b_byte_%out_bool = load b_ip_%out_bool+0 as u8
+    bytes_eq_%out_bool = eq a_byte_%out_bool, b_byte_%out_bool
+    !a_byte_%out_bool
+    !b_byte_%out_bool
+    !a_ip_%out_bool
+    !b_ip_%out_bool
+    br bytes_eq_%out_bool -> L_XSEQ_NEXT_%out_bool, L_XSEQ_FALSE_%out_bool
+L_XSEQ_NEXT_%out_bool:
+    next_idx_%out_bool = add idx_%out_bool, 1
+    store idx_slot_%out_bool+0, next_idx_%out_bool as u64
+    !idx_%out_bool
+    !done_%out_bool
+    !bytes_eq_%out_bool
+    !next_idx_%out_bool
+    jmp L_XSEQ_HEAD_%out_bool
+L_XSEQ_TRUE_%out_bool:
+    %out_bool = add 0, 1
+    !same_len_%out_bool
+    jmp L_XSEQ_END_%out_bool
+L_XSEQ_FALSE_%out_bool:
+    %out_bool = add 0, 0
+    !bytes_eq_%out_bool
+    !same_len_%out_bool
+    jmp L_XSEQ_END_%out_bool
+L_XSEQ_NE_%out_bool:
+    %out_bool = add 0, 0
+    !same_len_%out_bool
+L_XSEQ_END_%out_bool:
+[END_MACRO]

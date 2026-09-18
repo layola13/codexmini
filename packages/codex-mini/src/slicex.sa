@@ -1,0 +1,377 @@
+@import "sa_std/string.sa"
+
+// Single-output slice constructor for .sla expression use.
+// (The std SLICE_NEW macro names its out param %slice_reg, which the SLA
+// importer does not count as a leading output, so it cannot be used as an
+// expression.)
+
+[MACRO] X_SLICE %out_slice, %data_ptr, %length
+    store %out_slice+Slice_ptr, %data_ptr as ptr
+    store %out_slice+Slice_len, %length as u64
+[END_MACRO]
+
+// Pushes a (ptr, len) byte string into a StringBuf without creating a
+// let-bound slice value (which the .sla codegen cannot pass to macros).
+[MACRO] X_PUSH_PTR_LEN %buf, %sptr, %slen
+    __x_push_slice_%buf = slice_new %sptr, %slen
+    STRING_BUF_PUSH_STR %buf, __x_push_slice_%buf
+    !__x_push_slice_%buf
+[END_MACRO]
+
+// Byte-wise equality on (ptr, len) pairs. Avoids the .sla codegen issue where
+// a let-bound slice value passed to STR_EQ loses its type.
+[MACRO] X_STR_EQ %out_bool, %a_ptr, %a_len, %b_ptr, %b_len
+    same_len_%out_bool = eq %a_len, %b_len
+    idx_slot_%out_bool = stack_alloc 8
+    store idx_slot_%out_bool+0, 0 as u64
+    br same_len_%out_bool -> L_XSEQ_HEAD_%out_bool, L_XSEQ_NE_%out_bool
+L_XSEQ_LOOP_%out_bool:
+    jmp L_XSEQ_HEAD_%out_bool
+L_XSEQ_HEAD_%out_bool:
+    idx_%out_bool = load idx_slot_%out_bool+0 as u64
+    done_%out_bool = eq idx_%out_bool, %a_len
+    br done_%out_bool -> L_XSEQ_TRUE_%out_bool, L_XSEQ_BODY_%out_bool
+L_XSEQ_BODY_%out_bool:
+    a_ip_%out_bool = ptr_add %a_ptr, idx_%out_bool
+    b_ip_%out_bool = ptr_add %b_ptr, idx_%out_bool
+    a_byte_%out_bool = load a_ip_%out_bool+0 as u8
+    b_byte_%out_bool = load b_ip_%out_bool+0 as u8
+    bytes_eq_%out_bool = eq a_byte_%out_bool, b_byte_%out_bool
+    !a_byte_%out_bool
+    !b_byte_%out_bool
+    !a_ip_%out_bool
+    !b_ip_%out_bool
+    br bytes_eq_%out_bool -> L_XSEQ_NEXT_%out_bool, L_XSEQ_FALSE_%out_bool
+L_XSEQ_NEXT_%out_bool:
+    next_idx_%out_bool = add idx_%out_bool, 1
+    store idx_slot_%out_bool+0, next_idx_%out_bool as u64
+    !idx_%out_bool
+    !done_%out_bool
+    !bytes_eq_%out_bool
+    !next_idx_%out_bool
+    jmp L_XSEQ_HEAD_%out_bool
+L_XSEQ_TRUE_%out_bool:
+    %out_bool = add 0, 1
+    !same_len_%out_bool
+    jmp L_XSEQ_END_%out_bool
+L_XSEQ_FALSE_%out_bool:
+    %out_bool = add 0, 0
+    !bytes_eq_%out_bool
+    !same_len_%out_bool
+    jmp L_XSEQ_END_%out_bool
+L_XSEQ_NE_%out_bool:
+    %out_bool = add 0, 0
+    !same_len_%out_bool
+L_XSEQ_END_%out_bool:
+[END_MACRO]
+
+// Builds "base_url + /responses" directly. Avoids passing StringBuf or Slice
+// values through the .sla codegen (which cannot resolve their types).
+// URL builder using only primitives (ptr, u64). No struct passing.
+// X_URL_TOTAL_LEN: out = base_len + 10
+[MACRO] X_URL_TOTAL_LEN %out_len, %base_len
+    %out_len = add %base_len, 10
+[END_MACRO]
+
+// X_STACK_BUF256: allocates 256 bytes on stack (for URL)
+[MACRO] X_STACK_BUF256 %out_ptr
+    %out_ptr = stack_alloc 256
+[END_MACRO]
+
+// X_STACK_BUF8K: allocates 8192 bytes on stack (for prompt)
+[MACRO] X_STACK_BUF8K %out_ptr
+    %out_ptr = stack_alloc 8192
+[END_MACRO]
+
+// X_COPY_BYTES: copies len bytes from src to dest (statement, no output)
+// X_COPY_BYTES: copies len bytes from src to dest (statement, no output)
+// Uses a global counter for unique names to avoid PHI issues.
+[MACRO] X_COPY_BYTES %dest, %src, %len
+    __xcb_i = stack_alloc 8
+    store __xcb_i+0, 0 as u64
+    jmp L_XCB_HEAD
+L_XCB_HEAD:
+    __xcb_iv = load __xcb_i+0 as u64
+    __xcb_done = eq __xcb_iv, %len
+    br __xcb_done -> L_XCB_END, L_XCB_BODY
+L_XCB_BODY:
+    __xcb_sp = ptr_add %src, __xcb_iv
+    __xcb_dp = ptr_add %dest, __xcb_iv
+    __xcb_b = load __xcb_sp+0 as u8
+    store __xcb_dp+0, __xcb_b as u8
+    __xcb_ni = add __xcb_iv, 1
+    store __xcb_i+0, __xcb_ni as u64
+    !__xcb_sp
+    !__xcb_dp
+    !__xcb_b
+    !__xcb_iv
+    !__xcb_done
+    !__xcb_ni
+    jmp L_XCB_HEAD
+L_XCB_END:
+    !__xcb_iv
+    !__xcb_done
+[END_MACRO]
+
+// X_COPY_SUFFIX: copies "/responses" (10 bytes) to dest (statement)
+[MACRO] X_COPY_SUFFIX %dest
+    store %dest+0, 47 as u8
+    store %dest+1, 114 as u8
+    store %dest+2, 101 as u8
+    store %dest+3, 115 as u8
+    store %dest+4, 112 as u8
+    store %dest+5, 111 as u8
+    store %dest+6, 110 as u8
+    store %dest+7, 115 as u8
+    store %dest+8, 101 as u8
+    store %dest+9, 115 as u8
+[END_MACRO]
+
+// X_PTR_ADD: out = ptr + offset (single output)
+[MACRO] X_PTR_ADD %out_ptr, %base_ptr, %offset
+    %out_ptr = ptr_add %base_ptr, %offset
+[END_MACRO]
+
+// Joins argv[1..n] with single spaces. root is the JSON array, n is count.
+// Avoids passing Slice values through .sla codegen.
+// Builds prompt from argv JSON. Takes the ENV_ARGS_JSON buffer handle (u64).
+// Does JSON parsing internally to avoid .sla macro chaining limits.
+// Prompt builder primitives. All single-output, no struct passing.
+// X_PROMPT_COUNT: returns argc count from ENV_ARGS_JSON handle
+[MACRO] X_PROMPT_COUNT %out_n, %argc_h
+    __xpc_data_%out_n = call @sa_env_buffer_data(%argc_h)
+    __xpc_dlen_%out_n = call @sa_env_buffer_len(%argc_h)
+    __xpc_root_%out_n = call @sa_json_parse(&__xpc_data_%out_n, __xpc_dlen_%out_n)
+    __xpc_cnt_%out_n = stack_alloc 8
+    __xpc_st_%out_n = call @sa_json_value_count(__xpc_root_%out_n, &__xpc_cnt_%out_n)
+    %out_n = load __xpc_cnt_%out_n+0 as u64
+    !__xpc_data_%out_n
+    !__xpc_dlen_%out_n
+    !__xpc_root_%out_n
+    !__xpc_cnt_%out_n
+    !__xpc_st_%out_n
+[END_MACRO]
+
+// X_PROMPT_TOTAL_LEN: returns total bytes needed (sum of lens + spaces)
+[MACRO] X_PROMPT_TOTAL_LEN %out_len, %argc_h
+    X_PROMPT_COUNT __xptl_n_%out_len, %argc_h
+    __xptl_total_%out_len = stack_alloc 8
+    store __xptl_total_%out_len+0, 0 as u64
+    __xptl_i_%out_len = stack_alloc 8
+    store __xptl_i_%out_len+0, 1 as u64
+    jmp L_XPTL_HEAD_%out_len
+L_XPTL_HEAD_%out_len:
+    __xptl_iv_%out_len = load __xptl_i_%out_len+0 as u64
+    __xptl_done_%out_len = eq __xptl_iv_%out_len, __xptl_n_%out_len
+    br __xptl_done_%out_len -> L_XPTL_END_%out_len, L_XPTL_BODY_%out_len
+L_XPTL_BODY_%out_len:
+    X_PROMPT_ITEM_LEN __xptl_ilen_%out_len, %argc_h, __xptl_iv_%out_len
+    __xptl_cur_%out_len = load __xptl_total_%out_len+0 as u64
+    __xptl_add_%out_len = add __xptl_cur_%out_len, __xptl_ilen_%out_len
+    // add 1 for space (except first, but we over-allocate by 1, fine)
+    __xptl_add2_%out_len = add __xptl_add_%out_len, 1
+    store __xptl_total_%out_len+0, __xptl_add2_%out_len as u64
+    __xptl_ni_%out_len = add __xptl_iv_%out_len, 1
+    store __xptl_i_%out_len+0, __xptl_ni_%out_len as u64
+    jmp L_XPTL_HEAD_%out_len
+L_XPTL_END_%out_len:
+    %out_len = load __xptl_total_%out_len+0 as u64
+    !__xptl_total_%out_len
+    !__xptl_i_%out_len
+[END_MACRO]
+
+// X_PROMPT_ITEM_PTR: returns ptr to argv[index] string data
+[MACRO] X_PROMPT_ITEM_PTR %out_ptr, %argc_h, %idx
+    __xpip_data_%out_ptr = call @sa_env_buffer_data(%argc_h)
+    __xpip_dlen_%out_ptr = call @sa_env_buffer_len(%argc_h)
+    __xpip_root_%out_ptr = call @sa_json_parse(&__xpip_data_%out_ptr, __xpip_dlen_%out_ptr)
+    __xpip_tmp_%out_ptr = stack_alloc 8
+    __xpip_st_%out_ptr = call @sa_json_array_get(__xpip_root_%out_ptr, %idx, &__xpip_tmp_%out_ptr)
+    __xpip_item_%out_ptr = load __xpip_tmp_%out_ptr+0 as ptr
+    __xpip_sp_%out_ptr = call @sa_json_string_ptr(__xpip_item_%out_ptr)
+    %out_ptr = load __xpip_sp_%out_ptr+0 as ptr
+[END_MACRO]
+
+// X_PROMPT_ITEM_LEN: returns len of argv[index] string
+[MACRO] X_PROMPT_ITEM_LEN %out_len, %argc_h, %idx
+    __xpil_data_%out_len = call @sa_env_buffer_data(%argc_h)
+    __xpil_dlen_%out_len = call @sa_env_buffer_len(%argc_h)
+    __xpil_root_%out_len = call @sa_json_parse(&__xpil_data_%out_len, __xpil_dlen_%out_len)
+    __xpil_tmp_%out_len = stack_alloc 8
+    __xpil_st_%out_len = call @sa_json_array_get(__xpil_root_%out_len, %idx, &__xpil_tmp_%out_len)
+    __xpil_item_%out_len = load __xpil_tmp_%out_len+0 as ptr
+    %out_len = call @sa_json_string_len(__xpil_item_%out_len)
+[END_MACRO]
+
+// X_WRITE_SPACE: writes a space (32) to dest (statement)
+[MACRO] X_WRITE_SPACE %dest
+    store %dest+0, 32 as u8
+[END_MACRO]
+
+
+// X_PROMPT_PTR: builds prompt, returns ptr (single output)
+// Takes argc handle (u64) from ENV_ARGS_JSON
+[MACRO] X_PROMPT_PTR %out_ptr, %argc_h
+    // Get count
+    __xpp_data_%out_ptr = call @sa_env_buffer_data(%argc_h)
+    __xpp_dlen_%out_ptr = call @sa_env_buffer_len(%argc_h)
+    __xpp_root_%out_ptr = call @sa_json_parse(&__xpp_data_%out_ptr, __xpp_dlen_%out_ptr)
+    __xpp_cnt_%out_ptr = stack_alloc 8
+    __xpp_st_%out_ptr = call @sa_json_value_count(__xpp_root_%out_ptr, &__xpp_cnt_%out_ptr)
+    __xpp_n_%out_ptr = load __xpp_cnt_%out_ptr+0 as u64
+    // Alloc 8K buffer on stack
+    __xpp_buf_%out_ptr = stack_alloc 8192
+    __xpp_pos_%out_ptr = stack_alloc 8
+    store __xpp_pos_%out_ptr+0, 0 as u64
+    __xpp_i_%out_ptr = stack_alloc 8
+    store __xpp_i_%out_ptr+0, 1 as u64
+    jmp L_XPP_HEAD_%out_ptr
+L_XPP_HEAD_%out_ptr:
+    __xpp_iv_%out_ptr = load __xpp_i_%out_ptr+0 as u64
+    __xpp_done_%out_ptr = eq __xpp_iv_%out_ptr, __xpp_n_%out_ptr
+    br __xpp_done_%out_ptr -> L_XPP_END_%out_ptr, L_XPP_BODY_%out_ptr
+L_XPP_BODY_%out_ptr:
+    __xpp_posv_%out_ptr = load __xpp_pos_%out_ptr+0 as u64
+    __xpp_first_%out_ptr = eq __xpp_iv_%out_ptr, 1
+    br __xpp_first_%out_ptr -> L_XPP_NOSP_%out_ptr, L_XPP_SP_%out_ptr
+L_XPP_SP_%out_ptr:
+    __xpp_sp_%out_ptr = ptr_add __xpp_buf_%out_ptr, __xpp_posv_%out_ptr
+    store __xpp_sp_%out_ptr+0, 32 as u8
+    __xpp_posv2_%out_ptr = add __xpp_posv_%out_ptr, 1
+    store __xpp_pos_%out_ptr+0, __xpp_posv2_%out_ptr as u64
+    jmp L_XPP_NOSP_%out_ptr
+L_XPP_NOSP_%out_ptr:
+    __xpp_posv3_%out_ptr = load __xpp_pos_%out_ptr+0 as u64
+    // Get item ptr/len
+    __xpp_tmp_%out_ptr = stack_alloc 8
+    __xpp_gst_%out_ptr = call @sa_json_array_get(__xpp_root_%out_ptr, __xpp_iv_%out_ptr, &__xpp_tmp_%out_ptr)
+    __xpp_item_%out_ptr = load __xpp_tmp_%out_ptr+0 as ptr
+    __xpp_sptr_%out_ptr = call @sa_json_string_ptr(__xpp_item_%out_ptr)
+    __xpp_slen_%out_ptr = call @sa_json_string_len(__xpp_item_%out_ptr)
+    __xpp_ip_%out_ptr = load __xpp_sptr_%out_ptr+0 as ptr
+    // Copy bytes using helper macro
+    __xpp_dp_%out_ptr = ptr_add __xpp_buf_%out_ptr, __xpp_posv3_%out_ptr
+    EXPAND X_COPY_BYTES __xpp_dp_%out_ptr, __xpp_ip_%out_ptr, __xpp_slen_%out_ptr
+    __xpp_newpos_%out_ptr = add __xpp_posv3_%out_ptr, __xpp_slen_%out_ptr
+    store __xpp_pos_%out_ptr+0, __xpp_newpos_%out_ptr as u64
+    __xpp_ni_%out_ptr = add __xpp_iv_%out_ptr, 1
+    store __xpp_i_%out_ptr+0, __xpp_ni_%out_ptr as u64
+    jmp L_XPP_HEAD_%out_ptr
+L_XPP_END_%out_ptr:
+    %out_ptr = __xpp_buf_%out_ptr
+[END_MACRO]
+
+// X_PROMPT_LEN: returns prompt len (single output)
+[MACRO] X_PROMPT_LEN %out_len, %argc_h
+    __xpl_data_%out_len = call @sa_env_buffer_data(%argc_h)
+    __xpl_dlen_%out_len = call @sa_env_buffer_len(%argc_h)
+    __xpl_root_%out_len = call @sa_json_parse(&__xpl_data_%out_len, __xpl_dlen_%out_len)
+    __xpl_cnt_%out_len = stack_alloc 8
+    __xpl_st_%out_len = call @sa_json_value_count(__xpl_root_%out_len, &__xpl_cnt_%out_len)
+    __xpl_n_%out_len = load __xpl_cnt_%out_len+0 as u64
+    __xpl_total_%out_len = stack_alloc 8
+    store __xpl_total_%out_len+0, 0 as u64
+    __xpl_i_%out_len = stack_alloc 8
+    store __xpl_i_%out_len+0, 1 as u64
+    jmp L_XPL_HEAD_%out_len
+L_XPL_HEAD_%out_len:
+    __xpl_iv_%out_len = load __xpl_i_%out_len+0 as u64
+    __xpl_done_%out_len = eq __xpl_iv_%out_len, __xpl_n_%out_len
+    br __xpl_done_%out_len -> L_XPL_END_%out_len, L_XPL_BODY_%out_len
+L_XPL_BODY_%out_len:
+    __xpl_tmp_%out_len = stack_alloc 8
+    __xpl_gst_%out_len = call @sa_json_array_get(__xpl_root_%out_len, __xpl_iv_%out_len, &__xpl_tmp_%out_len)
+    __xpl_item_%out_len = load __xpl_tmp_%out_len+0 as ptr
+    __xpl_ilen_%out_len = call @sa_json_string_len(__xpl_item_%out_len)
+    __xpl_cur_%out_len = load __xpl_total_%out_len+0 as u64
+    __xpl_add_%out_len = add __xpl_cur_%out_len, __xpl_ilen_%out_len
+    __xpl_add2_%out_len = add __xpl_add_%out_len, 1
+    store __xpl_total_%out_len+0, __xpl_add2_%out_len as u64
+    __xpl_ni_%out_len = add __xpl_iv_%out_len, 1
+    store __xpl_i_%out_len+0, __xpl_ni_%out_len as u64
+    jmp L_XPL_HEAD_%out_len
+L_XPL_END_%out_len:
+    %out_len = load __xpl_total_%out_len+0 as u64
+[END_MACRO]
+
+
+// X_ARGV1_PTR: returns ptr to argv[1] string data (single output, no loop)
+[MACRO] X_ARGV1_PTR %out_ptr, %argc_h
+    __xa1_data_%out_ptr = call @sa_env_buffer_data(%argc_h)
+    __xa1_dlen_%out_ptr = call @sa_env_buffer_len(%argc_h)
+    __xa1_root_%out_ptr = call @sa_json_parse(&__xa1_data_%out_ptr, __xa1_dlen_%out_ptr)
+    __xa1_tmp_%out_ptr = stack_alloc 8
+    __xa1_st_%out_ptr = call @sa_json_array_get(__xa1_root_%out_ptr, 1, &__xa1_tmp_%out_ptr)
+    __xa1_item_%out_ptr = load __xa1_tmp_%out_ptr+0 as ptr
+    __xa1_sptr_%out_ptr = call @sa_json_string_ptr(__xa1_item_%out_ptr)
+    %out_ptr = load __xa1_sptr_%out_ptr+0 as ptr
+[END_MACRO]
+
+// X_ARGV1_LEN: returns len of argv[1] string (single output, no loop)
+[MACRO] X_ARGV1_LEN %out_len, %argc_h
+    __xa1l_data_%out_len = call @sa_env_buffer_data(%argc_h)
+    __xa1l_dlen_%out_len = call @sa_env_buffer_len(%argc_h)
+    __xa1l_root_%out_len = call @sa_json_parse(&__xa1l_data_%out_len, __xa1l_dlen_%out_len)
+    __xa1l_tmp_%out_len = stack_alloc 8
+    __xa1l_st_%out_len = call @sa_json_array_get(__xa1l_root_%out_len, 1, &__xa1l_tmp_%out_len)
+    __xa1l_item_%out_len = load __xa1l_tmp_%out_len+0 as ptr
+    %out_len = call @sa_json_string_len(__xa1l_item_%out_len)
+[END_MACRO]
+
+// X_OBJ_HAS: single-output bool — true if object node has key
+[MACRO] X_OBJ_HAS %out_ok, %node, %key_ptr, %key_len
+    __xoh_h_%out_ok = stack_alloc 8
+    __xoh_st_%out_ok = call @sa_json_object_get(%node, &%key_ptr, %key_len, &__xoh_h_%out_ok)
+    %out_ok = eq __xoh_st_%out_ok, 0
+[END_MACRO]
+
+// X_OBJ_STR_PTR: single-output ptr to string field data (field must exist)
+[MACRO] X_OBJ_STR_PTR %out_ptr, %node, %key_ptr, %key_len
+    __xosp_s_%out_ptr = stack_alloc 8
+    __xosp_l_%out_ptr = stack_alloc 8
+    __xosp_st_%out_ptr = call @sa_json_object_get_string(%node, &%key_ptr, %key_len, &__xosp_s_%out_ptr, &__xosp_l_%out_ptr)
+    %out_ptr = load __xosp_s_%out_ptr+0 as ptr
+[END_MACRO]
+
+// X_OBJ_STR_LEN: single-output u64 length of string field (field must exist)
+[MACRO] X_OBJ_STR_LEN %out_len, %node, %key_ptr, %key_len
+    __xosl_s_%out_len = stack_alloc 8
+    __xosl_l_%out_len = stack_alloc 8
+    __xosl_st_%out_len = call @sa_json_object_get_string(%node, &%key_ptr, %key_len, &__xosl_s_%out_len, &__xosl_l_%out_len)
+    %out_len = load __xosl_l_%out_len+0 as u64
+[END_MACRO]
+
+// X_SHELL_EXEC: runs sh -c <cmd>, captures stdout.
+// Outputs: out_ptr/out_len (stdout data), out_ok (bool).
+// Builds the argv Slice array manually (slice_new cannot cross .sla lowering).
+[MACRO] X_SHELL_EXEC %out_ptr, %out_len, %out_ok, %sh_ptr, %sh_len, %dc_ptr, %dc_len, %cmd_ptr, %cmd_len
+    __xse_argv_%out_ptr = stack_alloc 48
+    store __xse_argv_%out_ptr+Slice_ptr, %sh_ptr as ptr
+    store __xse_argv_%out_ptr+Slice_len, %sh_len as u64
+    __xse_e1_%out_ptr = add __xse_argv_%out_ptr, 16
+    store __xse_e1_%out_ptr+Slice_ptr, %dc_ptr as ptr
+    store __xse_e1_%out_ptr+Slice_len, %dc_len as u64
+    __xse_e2_%out_ptr = add __xse_argv_%out_ptr, 32
+    store __xse_e2_%out_ptr+Slice_ptr, %cmd_ptr as ptr
+    store __xse_e2_%out_ptr+Slice_len, %cmd_len as u64
+    __xse_code_%out_ptr = stack_alloc 4
+    __xse_stdout_%out_ptr = stack_alloc 8
+    __xse_stderr_%out_ptr = stack_alloc 8
+    __xse_st_%out_ptr = call @sa_std_process_exec_capture(__xse_argv_%out_ptr, 3, &__xse_code_%out_ptr, &__xse_stdout_%out_ptr, &__xse_stderr_%out_ptr)
+    %out_ok = eq __xse_st_%out_ptr, 0
+    __xse_stdout_h_%out_ptr = load __xse_stdout_%out_ptr+0 as u64
+    __xse_dp_%out_ptr = call @sa_fs_read_buffer_data(__xse_stdout_h_%out_ptr)
+    %out_ptr = load __xse_dp_%out_ptr+0 as ptr
+    %out_len = call @sa_fs_read_buffer_len(__xse_stdout_h_%out_ptr)
+[END_MACRO]
+
+// X_ARGV_FILL: fills a [u64; 6] (layout-identical to [Slice; 3]) from (ptr,len) pairs.
+// arr_ptr must be &array from .sla.
+[MACRO] X_ARGV_FILL %arr_ptr, %p0, %l0, %p1, %l1, %p2, %l2
+    store %arr_ptr+0, %p0 as ptr
+    store %arr_ptr+8, %l0 as u64
+    store %arr_ptr+16, %p1 as ptr
+    store %arr_ptr+24, %l1 as u64
+    store %arr_ptr+32, %p2 as ptr
+    store %arr_ptr+40, %l2 as u64
+[END_MACRO]

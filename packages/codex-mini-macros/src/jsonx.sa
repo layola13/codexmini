@@ -1,0 +1,58 @@
+@import "sa_std/encoding/json.sai"
+
+// Single-output wrappers over the sa_json_* externs, for ergonomic use from
+// .sla (imported [MACRO]s become expressions only when they have exactly one
+// leading %out_ param).
+
+[MACRO] J_GET %out_node, %node, %key_ptr, %key_len
+    __j_get_slot_%out_node = stack_alloc 8
+    __j_get_st_%out_node = call @sa_json_object_get(%node, &%key_ptr, %key_len, &__j_get_slot_%out_node)
+    %out_node = load __j_get_slot_%out_node+0 as ptr
+    !__j_get_st_%out_node
+[END_MACRO]
+
+[MACRO] J_HAS_ST %out_st, %node, %key_ptr, %key_len
+    __j_has_slot_%out_st = stack_alloc 8
+    %out_st = call @sa_json_object_get(%node, &%key_ptr, %key_len, &__j_has_slot_%out_st)
+    !__j_has_slot_%out_st
+[END_MACRO]
+
+[MACRO] J_STR_PTR %out_ptr, %node, %key_ptr, %key_len
+    __j_sp_slot_%out_ptr = stack_alloc 8
+    __j_sp_len_%out_ptr = stack_alloc 8
+    __j_sp_st_%out_ptr = call @sa_json_object_get_string(%node, &%key_ptr, %key_len, &__j_sp_slot_%out_ptr, &__j_sp_len_%out_ptr)
+    %out_ptr = load __j_sp_slot_%out_ptr+0 as ptr
+    !__j_sp_st_%out_ptr
+    !__j_sp_len_%out_ptr
+[END_MACRO]
+
+[MACRO] J_STR_LEN %out_len, %node, %key_ptr, %key_len
+    __j_sl_slot_%out_len = stack_alloc 8
+    __j_sl_len_%out_len = stack_alloc 8
+    __j_sl_st_%out_len = call @sa_json_object_get_string(%node, &%key_ptr, %key_len, &__j_sl_slot_%out_len, &__j_sl_len_%out_len)
+    %out_len = load __j_sl_len_%out_len+0 as u64
+    !__j_sl_st_%out_len
+    !__j_sl_slot_%out_len
+[END_MACRO]
+
+[MACRO] J_ARR_GET %out_node, %node, %index
+    __j_arr_slot_%out_node = stack_alloc 8
+    __j_arr_st_%out_node = call @sa_json_array_get(%node, %index, &__j_arr_slot_%out_node)
+    %out_node = load __j_arr_slot_%out_node+0 as ptr
+    !__j_arr_st_%out_node
+[END_MACRO]
+
+[MACRO] J_COUNT %out_n, %node
+    __j_c_slot_%out_n = stack_alloc 8
+    __j_c_st_%out_n = call @sa_json_value_count(%node, &__j_c_slot_%out_n)
+    %out_n = load __j_c_slot_%out_n+0 as u64
+    !__j_c_st_%out_n
+[END_MACRO]
+
+[MACRO] J_SPTR %out_ptr, %node
+    %out_ptr = call @sa_json_string_ptr(%node)
+[END_MACRO]
+
+[MACRO] J_SLEN %out_len, %node
+    %out_len = call @sa_json_string_len(%node)
+[END_MACRO]

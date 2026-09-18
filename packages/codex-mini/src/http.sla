@@ -1,0 +1,85 @@
+@import "plugin_abi/sa_http_client.sai"
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+
+struct MiniHttpResponse {
+    status: u16,
+    body_ptr: ptr,
+    body_len: u64,
+    resp: ptr,
+    ok: bool,
+}
+
+fn mini_http_response_failed() -> MiniHttpResponse {
+    return MiniHttpResponse {
+        status: 0,
+        body_ptr: PTR_NULL(),
+        body_len: 0,
+        resp: PTR_NULL(),
+        ok: false,
+    };
+}
+
+fn mini_http_response_free(resp: MiniHttpResponse) -> bool {
+    if resp.resp == PTR_NULL() {
+        return false;
+    };
+    let st = sa_http_client_resp_free(resp.resp);
+    return st == 0;
+}
+
+// POSTs a JSON body over TLS and returns the full response body.
+// The caller must call mini_http_response_free when done with the body.
+fn mini_http_post_json(url_ptr: ptr, url_len: u64, body_ptr: ptr, body_len: u64, api_key_ptr: ptr, api_key_len: u64) -> MiniHttpResponse {
+    var client: ptr;
+    client = PTR_NULL();
+    let ca_path = STR_PTR("/etc/ssl/certs/ca-certificates.crt");
+    let ca_len = STR_LEN("/etc/ssl/certs/ca-certificates.crt");
+    let nst = sa_http_client_new_v2(1, ca_path, ca_len, &client);
+    if nst != 0 {
+        return mini_http_response_failed();
+    };
+    var req: ptr;
+    req = PTR_NULL();
+    let rnst = sa_http_client_req_new(client, 2, url_ptr, url_len, &req);
+    if rnst != 0 {
+        sa_http_client_free(client);
+        return mini_http_response_failed();
+    };
+    let auth_st = sa_http_client_req_add_openai_auth(req, api_key_ptr, api_key_len);
+    let ct_st = sa_http_client_req_add_header(req, STR_PTR("content-type"), STR_LEN("content-type"), STR_PTR("application/json"), STR_LEN("application/json"));
+    let body_st = sa_http_client_req_set_body(req, body_ptr, body_len);
+    if auth_st != 0 || ct_st != 0 || body_st != 0 {
+        sa_http_client_req_free(req);
+        sa_http_client_free(client);
+        return mini_http_response_failed();
+    };
+    var resp: ptr;
+    resp = PTR_NULL();
+    let sst = sa_http_client_req_send(req, &resp);
+    if sst != 0 {
+        sa_http_client_req_free(req);
+        sa_http_client_free(client);
+        return mini_http_response_failed();
+    };
+    sa_http_client_req_free(req);
+    sa_http_client_free(client);
+    let status = sa_http_client_resp_status(resp);
+    let bptr = sa_http_client_resp_body_ptr(resp);
+    let blen = sa_http_client_resp_body_len(resp);
+    // NOTE: sa_http_client_resp_body_slice is stubbed in libsa_std.a (returns
+    // null/0); use ptr+len which resolve to the real plugin implementation.
+    return MiniHttpResponse {
+        status: status,
+        body_ptr: bptr,
+        body_len: blen,
+        resp: resp,
+        ok: true,
+    };
+}
+
+@test "http response failed defaults"() {
+    let r = mini_http_response_failed();
+    if r.ok != false { panic(301); };
+    if r.body_len != 0 { panic(302); };
+}

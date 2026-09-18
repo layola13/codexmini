@@ -1,0 +1,10 @@
+[reachable]
+main
+[types]
+X_BUILD_PROMPT
+pptr
+plen
+n
+root
+println
+PTR_NULL

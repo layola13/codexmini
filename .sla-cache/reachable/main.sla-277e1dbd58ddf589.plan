@@ -1,0 +1,14 @@
+[reachable]
+mini_turn_outcome_failed
+protocol__mini_turn_outcome_failed
+main
+[types]
+Vec
+MiniToolCall
+o
+code
+println
+PTR_NULL
+k
+MiniTurnOutcome
+MiniEventKind

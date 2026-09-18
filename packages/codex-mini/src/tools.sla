@@ -1,0 +1,62 @@
+@import "sa_std/process.sa"
+@import "sa_std/fs.sa"
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "slicex.sa"
+@import "sa_std/core/slice.sa"
+
+struct MiniExecResult {
+    code: i32,
+    out_ptr: ptr,
+    out_len: u64,
+    ok: bool,
+}
+
+fn mini_exec_result_failed() -> MiniExecResult {
+    return MiniExecResult {
+        code: -1,
+        out_ptr: PTR_NULL(),
+        out_len: 0,
+        ok: false,
+    };
+}
+
+// Runs `sh -c <command>` and captures stdout.
+// argv is [u64; 6] with identical layout to [Slice; 3] (ptr,len pairs),
+// filled by X_ARGV_FILL because ptr->u64 casts are not allowed in .sla.
+fn mini_shell_exec(cmd_ptr: ptr, cmd_len: u64) -> MiniExecResult {
+    let sh_ptr = STR_PTR("sh");
+    let sh_len = STR_LEN("sh");
+    let dc_ptr = STR_PTR("-c");
+    let dc_len = STR_LEN("-c");
+    let argv = [0u64, 0u64, 0u64, 0u64, 0u64, 0u64];
+    X_ARGV_FILL(&argv, sh_ptr, sh_len, dc_ptr, dc_len, cmd_ptr, cmd_len);
+    let code_slot: u32 = 0;
+    let stdout_slot: u64 = 0;
+    let stderr_slot: u64 = 0;
+    let st = sa_std_process_exec_capture(&argv, 3, &code_slot, &stdout_slot, &stderr_slot);
+    if st != 0 {
+        return mini_exec_result_failed();
+    };
+    let out_ptr = FS_READ_BUFFER_DATA(stdout_slot);
+    let out_len = FS_READ_BUFFER_LEN(stdout_slot);
+    return MiniExecResult {
+        code: code_slot as i32,
+        out_ptr: out_ptr,
+        out_len: out_len,
+        ok: true,
+    };
+}
+
+fn mini_exec_result_free(result: MiniExecResult) -> bool {
+    if result.ok != true {
+        return false;
+    };
+    return true;
+}
+
+@test "exec result failed defaults"() {
+    let r = mini_exec_result_failed();
+    if r.ok != false { panic(401); };
+    if r.out_len != 0 { panic(402); };
+}

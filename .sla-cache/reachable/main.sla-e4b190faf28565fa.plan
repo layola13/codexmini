@@ -1,0 +1,16 @@
+[reachable]
+mini_turn_outcome_failed
+parsetest__make_outcome
+protocol__mini_turn_outcome_failed
+main
+make_outcome
+[types]
+Vec
+outcome
+o
+code
+println
+PTR_NULL
+MiniEventKind
+MiniTurnOutcome
+MiniToolCall

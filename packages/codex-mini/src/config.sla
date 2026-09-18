@@ -1,0 +1,48 @@
+@import "sa_std/env.sa"
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+
+struct MiniConfig {
+    api_key_ptr: ptr,
+    api_key_len: u64,
+    model_ptr: ptr,
+    model_len: u64,
+    base_url_ptr: ptr,
+    base_url_len: u64,
+    max_turns: u64,
+    ok: bool,
+}
+
+fn mini_config_env_or(key_lit_ptr: ptr, key_lit_len: u64, fallback_ptr: ptr, fallback_len: u64) -> (ptr, u64) {
+    let st = sa_env_has(key_lit_ptr, key_lit_len);
+    if st != 0 {
+        return (fallback_ptr, fallback_len);
+    };
+    let buf = ENV_GET_PTR(key_lit_ptr, key_lit_len);
+    let len = ENV_BUFFER_LEN(buf);
+    if len == 0 {
+        return (fallback_ptr, fallback_len);
+    };
+    return (ENV_BUFFER_DATA(buf), len);
+}
+
+fn mini_config_load() -> MiniConfig {
+    let (key_ptr, key_len) = mini_config_env_or(STR_PTR("OPENAI_API_KEY"), STR_LEN("OPENAI_API_KEY"), PTR_NULL(), 0);
+    let cfg = MiniConfig {
+        api_key_ptr: key_ptr,
+        api_key_len: key_len,
+        model_ptr: STR_PTR("gpt-5"),
+        model_len: STR_LEN("gpt-5"),
+        base_url_ptr: STR_PTR("https://api.openai.com/v1"),
+        base_url_len: STR_LEN("https://api.openai.com/v1"),
+        max_turns: 8,
+        ok: key_len != 0,
+    };
+    return cfg;
+}
+
+@test "config defaults without env"() {
+    let cfg = mini_config_load();
+    if cfg.model_len == 0 { panic(101); };
+    if cfg.base_url_len == 0 { panic(102); };
+}

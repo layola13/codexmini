@@ -1,0 +1,9 @@
+[reachable]
+main
+[types]
+STRING_BUF_NEW
+STR_LEN
+url
+println
+X_PUSH_PTR_LEN
+STR_PTR

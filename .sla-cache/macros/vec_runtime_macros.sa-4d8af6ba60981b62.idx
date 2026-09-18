@@ -1,0 +1,3 @@
+ITER_VEC_NEW|1|1|0|0|sa_vec_new
+ITER_VEC_PUSH|3|0|0|0|sa_vec_push
+ITER_VEC_PUSH_U64|2|0|0|0|sa_vec_push

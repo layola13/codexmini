@@ -1,0 +1,5 @@
+[reachable]
+main
+[types]
+println
+X_STACK_BUF256

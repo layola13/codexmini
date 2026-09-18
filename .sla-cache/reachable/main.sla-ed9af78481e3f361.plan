@@ -1,0 +1,10 @@
+[reachable]
+main
+[types]
+STR_PTR
+JSON_PARSE
+n
+root
+println
+STR_LEN
+J_COUNT

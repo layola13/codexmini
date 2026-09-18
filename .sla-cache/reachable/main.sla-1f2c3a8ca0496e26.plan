@@ -1,0 +1,7 @@
+[reachable]
+main
+[types]
+println
+c
+PTR_NULL
+MiniToolCall
