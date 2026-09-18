@@ -403,7 +403,10 @@ fn mini_model_run_conversation(
                         return 1;
                     };
                     seq = seq + 1;
-                    // 4. Push function output for the next request.
+                    // 4. Push the original function_call (required by the API: every
+                    // function_call_output must be preceded by its function_call
+                    // with a matching call_id), then the output, for the next request.
+                    items.push(mini_input_func_call(call.call_id_ptr, call.call_id_len, call.name_ptr, call.name_len, call.args_ptr, call.args_len));
                     items.push(mini_input_func_output(call.call_id_ptr, call.call_id_len, out_ptr, out_len));
                     if session_bump(session_id, seq) != true {
                         println("scodex-mini: session save failed");
