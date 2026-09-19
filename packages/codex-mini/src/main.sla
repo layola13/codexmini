@@ -182,16 +182,18 @@ fn mini_cli_run_image_mcp(path_idx: u64, mcp_ptr: ptr, mcp_len: u64) -> i32 {
         return 1;
     };
     // Persist as role 4 (user image message): {"text","img","mime"} JSON blob.
+    // Buffered; flushed once after the run (even on error).
     let (blobp, bloblen) = mini_image_session_blob(prp, prl, b64p, b64l, mptr, mlen);
-    if session_add_message(sid, 0, 4, blobp, bloblen) != true {
-        println("scodex-mini: session save failed");
-        return 1;
-    };
+    let pend: Vec<PendingMsg> = Vec::new();
+    pend = session_add_message(pend, 0, 4, blobp, bloblen);
     let items: Vec<MiniInputItem> = Vec::new();
     items.push(mini_input_user_image(prp, prl, b64p, b64l, mptr, mlen));
     // NOTE: bufh (image base64 buffer) stays alive for the whole run;
     // freed on process exit.
-    let code = mini_model_run_conversation(cfg, sid, 1, items);
+    let (code, pend2) = mini_model_run_conversation(cfg, sid, 1, items, pend);
+    if session_flush_messages(sid, pend2) != true {
+        return 1;
+    };
     return code;
 }
 
@@ -230,14 +232,16 @@ fn mini_cli_run_file_mcp(path_idx: u64, mcp_ptr: ptr, mcp_len: u64) -> i32 {
     if sid == 0 {
         return 1;
     };
-    if session_add_message(sid, 0, 0, cptr, clen) != true {
-        println("scodex-mini: session save failed");
-        return 1;
-    };
+    // Buffer the user message; flushed once after the run (even on error).
+    let pend: Vec<PendingMsg> = Vec::new();
+    pend = session_add_message(pend, 0, 0, cptr, clen);
     let items: Vec<MiniInputItem> = Vec::new();
     items.push(mini_input_user(cptr, clen));
     // NOTE: fbufh (file text buffer) stays alive for the whole run.
-    let code = mini_model_run_conversation(cfg, sid, 1, items);
+    let (code, pend2) = mini_model_run_conversation(cfg, sid, 1, items, pend);
+    if session_flush_messages(sid, pend2) != true {
+        return 1;
+    };
     return code;
 }
 
@@ -302,12 +306,15 @@ fn main() -> i32 {
             if st != 0 {
                 return 1;
             };
-            if session_add_message(sid, next_seq, 0, prp, prl) != true {
-                println("scodex-mini: session save failed");
+            // Buffer the follow-up prompt; flushed once after the run.
+            let pend: Vec<PendingMsg> = Vec::new();
+            pend = session_add_message(pend, next_seq, 0, prp, prl);
+            items.push(mini_input_user(prp, prl));
+            let (code, pend2) = mini_model_run_conversation(cfg, sid, next_seq + 1, items, pend);
+            if session_flush_messages(sid, pend2) != true {
                 return 1;
             };
-            items.push(mini_input_user(prp, prl));
-            return mini_model_run_conversation(cfg, sid, next_seq + 1, items);
+            return code;
         };
         if mini_model_str_eq(b1p, b1l, STR_PTR("--image"), STR_LEN("--image")) == true {
             return mini_cli_run_image_mcp(arg_base + 1, mcp_ptr, mcp_len);
@@ -341,12 +348,14 @@ fn main() -> i32 {
     if sid == 0 {
         return 1;
     };
-    if session_add_message(sid, 0, 0, prompt_ptr, prompt_len) != true {
-        println("scodex-mini: session save failed");
-        return 1;
-    };
+    // Buffer the user prompt; flushed once after the run (even on error).
+    let pend: Vec<PendingMsg> = Vec::new();
+    pend = session_add_message(pend, 0, 0, prompt_ptr, prompt_len);
     let items: Vec<MiniInputItem> = Vec::new();
     items.push(mini_input_user(prompt_ptr, prompt_len));
-    let code = mini_model_run_conversation(cfg, sid, 1, items);
+    let (code, pend2) = mini_model_run_conversation(cfg, sid, 1, items, pend);
+    if session_flush_messages(sid, pend2) != true {
+        return 1;
+    };
     return code;
 }

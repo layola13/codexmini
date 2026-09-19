@@ -675,8 +675,10 @@ fn mini_model_run_conversation(
     cfg: MiniConfig,
     session_id: u64,
     start_seq: u64,
-    items: Vec<MiniInputItem>
-) -> i32 {
+    items: Vec<MiniInputItem>,
+    pend: Vec<PendingMsg>
+) -> (i32, Vec<PendingMsg>) {
+    let p: Vec<PendingMsg> = pend;
     var seq: u64;
     seq = start_seq;
     let (url_ptr, url_len) = mini_model_build_url(cfg);
@@ -709,7 +711,7 @@ fn mini_model_run_conversation(
         let json_buf = mini_model_build_request_dispatch(cfg, items, eff_skills_ptr, eff_skills_len, mcp_tools_ptr, mcp_tools_len);
         if json_buf == PTR_NULL() {
             println("scodex-mini: failed to build request");
-            return 1;
+            return (1, p);
         };
         let body_ref = sa_json_buffer_data(json_buf);
         let body_ptr: ptr = body_ref;
@@ -724,7 +726,7 @@ fn mini_model_run_conversation(
         let sse_rc = sa_http_client_sse_turn(url_ptr, url_len, body_ptr, body_len, cfg.api_key_ptr, cfg.api_key_len, cfg.api_mode, &sse_text_ptr, &sse_text_len, &sse_calls_ptr, &sse_calls_len);
         if sse_rc == 2 {
             println("scodex-mini: sse request failed");
-            return 1;
+            return (1, p);
         };
         // Build outcome from native result. Text was already streamed live.
         let outcome = mini_turn_outcome_failed(0);
@@ -745,23 +747,16 @@ fn mini_model_run_conversation(
                 println("scodex-mini: response parse failed code={}", outcome.error_code);
                 sa_http_client_sse_turn_free(sse_text_ptr, sse_text_len);
                 sa_http_client_sse_turn_free(sse_calls_ptr, sse_calls_len);
-                return 1;
+                return (1, p);
             },
             MiniEventKind::TextDelta => {
-                // Text was already streamed live by native sse_turn; just save.
-                let save_ok = session_add_message(session_id, seq, 1, outcome.text_ptr, outcome.text_len);
+                // Text was already streamed live by native sse_turn; buffer it.
+                // Flushed (one tx) by the caller after the run.
+                p = session_add_message(p, seq, 1, outcome.text_ptr, outcome.text_len);
                 sa_http_client_sse_turn_free(sse_text_ptr, sse_text_len);
                 sa_http_client_sse_turn_free(sse_calls_ptr, sse_calls_len);
-                if save_ok != true {
-                    println("scodex-mini: session save failed");
-                    return 1;
-                };
                 seq = seq + 1;
-                if session_bump(session_id, seq) != true {
-                    println("scodex-mini: session save failed");
-                    return 1;
-                };
-                return 0;
+                return (0, p);
             },
             MiniEventKind::ToolCall => {
                 let ncalls = outcome.calls.len();
@@ -781,12 +776,9 @@ fn mini_model_run_conversation(
                     let bptr_ref = sa_json_buffer_data(buf);
                     let bptr: ptr = bptr_ref;
                     let blen = sa_json_buffer_len(buf);
-                    let save_ok = session_add_message(session_id, seq, 2, bptr, blen);
+                    // Buffer the tool call (role 2); flushed by the caller.
+                    p = session_add_message(p, seq, 2, bptr, blen);
                     sa_json_buffer_free(buf);
-                    if save_ok != true {
-                        println("scodex-mini: session save failed");
-                        return 1;
-                    };
                     seq = seq + 1;
                     // 2. Execute the tool.
                     let out_ptr: ptr = PTR_NULL();
@@ -836,34 +828,22 @@ fn mini_model_run_conversation(
                     let bptr2_ref = sa_json_buffer_data(buf2);
                     let bptr2: ptr = bptr2_ref;
                     let blen2 = sa_json_buffer_len(buf2);
-                    let save2_ok = session_add_message(session_id, seq, 3, bptr2, blen2);
+                    // Buffer the tool output (role 3); flushed by the caller.
+                    p = session_add_message(p, seq, 3, bptr2, blen2);
                     sa_json_buffer_free(buf2);
-                    if save2_ok != true {
-                        println("scodex-mini: session save failed");
-                        return 1;
-                    };
                     seq = seq + 1;
                     // 4. Push the original function_call (required by the API: every
                     // function_call_output must be preceded by its function_call
                     // with a matching call_id), then the output, for the next request.
                     items.push(mini_input_func_call(call.call_id_ptr, call.call_id_len, call.name_ptr, call.name_len, call.args_ptr, call.args_len));
                     items.push(mini_input_func_output(call.call_id_ptr, call.call_id_len, out_ptr, out_len));
-                    if session_bump(session_id, seq) != true {
-                        println("scodex-mini: session save failed");
-                        return 1;
-                    };
                     ci = ci + 1;
                 }
             },
             MiniEventKind::TurnDone => {
-                let bump_ok = session_bump(session_id, seq);
                 sa_http_client_sse_turn_free(sse_text_ptr, sse_text_len);
                 sa_http_client_sse_turn_free(sse_calls_ptr, sse_calls_len);
-                if bump_ok != true {
-                    println("scodex-mini: session save failed");
-                    return 1;
-                };
-                return 0;
+                return (0, p);
             },
         };
         // Free SSE buffers now that outcome is fully consumed.
@@ -871,11 +851,8 @@ fn mini_model_run_conversation(
         sa_http_client_sse_turn_free(sse_calls_ptr, sse_calls_len);
         turn = turn + 1;
     }
-    if session_bump(session_id, seq) != true {
-        println("scodex-mini: session save failed");
-        return 1;
-    };
-    return 0;
+    // Max turns exhausted: the caller flushes the buffered messages.
+    return (0, p);
 }
 
 @test "model input item constructors"() {
@@ -914,6 +891,15 @@ struct MessageRow {
     seq: u64,
     role: u64,
     body_blob: u64,
+}
+
+// A message buffered for batched persistence. body_ptr points to a
+// heap-owned copy (callers free their buffers right after buffering).
+struct PendingMsg {
+    seq: u64,
+    role: u64,
+    body_ptr: ptr,
+    body_len: u64,
 }
 
 fn session_db_sessions_schema() -> (ptr, u64) {
@@ -1033,27 +1019,82 @@ fn session_create(title_ptr: ptr, title_len: u64) -> u64 {
     return new_id;
 }
 
-fn session_add_message(session_id: u64, seq: u64, role: u64, body_ptr: ptr, body_len: u64) -> bool {
+fn session_add_message(pend: Vec<PendingMsg>, seq: u64, role: u64, body_ptr: ptr, body_len: u64) -> Vec<PendingMsg> {
+    // Copy body bytes to the heap: callers free their own buffers right
+    // after this returns (e.g. sa_json_buffer_free), so the pointer must
+    // not escape unowned.
+    let owned: ptr = PTR_NULL();
+    if body_len > 0 {
+        owned = X_HEAP_BUF_PTR(body_len);
+        X_COPY_BYTES(owned, body_ptr, body_len);
+    };
+    pend.push(PendingMsg { seq: seq, role: role, body_ptr: owned, body_len: body_len });
+    return pend;
+}
+
+// Persists all buffered messages for a session in two durable transactions:
+// (1) one write-tx on `messages`: tx_blob_put per body + tx_insert_rows,
+// committed atomically; (2) one session_bump for the sessions row.
+// Empty batch is a no-op. msg_count is derived as max(seq)+1, matching the
+// old per-message bump semantics. Bodies stay heap-allocated until process
+// exit (consistent with the rest of this CLI).
+fn session_flush_messages(session_id: u64, pend: Vec<PendingMsg>) -> bool {
+    let n = pend.len();
+    if n == 0 {
+        return true;
+    };
     let (root, root_len) = session_db_root();
-    let blob_id: u64 = 0;
-    let binfo = DbTableInfo { row_count: 0, segment_count: 0, epoch: 0, locked: 0 };
-    let bst = sa_db_blob_put(root, root_len,
-        STR_PTR("messages"), STR_LEN("messages"),
-        STR_PTR("texts"), STR_LEN("texts"),
-        body_ptr, body_len, &blob_id, &binfo);
-    if bst != 0 {
+    let tx: ptr = PTR_NULL();
+    let tbst = sa_db_tx_begin(root, root_len,
+        STR_PTR("messages"), STR_LEN("messages"), &tx);
+    if tbst != 0 {
         println("scodex-mini: session save failed");
         return false;
     };
-    let mrow = MessageRow { session_id: session_id, seq: seq, role: role, body_blob: blob_id };
+    let rows = X_HEAP_BUF_PTR(n * 32);
+    let max_seq: u64 = 0;
+    let i: u64 = 0;
+    while i < n {
+        let pm = pend[i];
+        let bid: u64 = 0;
+        let binfo = DbTableInfo { row_count: 0, segment_count: 0, epoch: 0, locked: 0 };
+        let pst = sa_db_tx_blob_put(tx,
+            STR_PTR("texts"), STR_LEN("texts"),
+            pm.body_ptr, pm.body_len, &bid, &binfo);
+        if pst != 0 {
+            sa_db_tx_rollback(tx);
+            println("scodex-mini: session save failed");
+            return false;
+        };
+        // Pack row [session_id, seq, role, body_blob] (32 bytes).
+        // Use X_ROW_PUT_U64 with absolute u64 column index (4 cols per row).
+        let base = i * 4;
+        X_ROW_PUT_U64(rows, base, session_id);
+        let base1 = base + 1;
+        X_ROW_PUT_U64(rows, base1, pm.seq);
+        let base2 = base + 2;
+        X_ROW_PUT_U64(rows, base2, pm.role);
+        let base3 = base + 3;
+        X_ROW_PUT_U64(rows, base3, bid);
+        if pm.seq > max_seq {
+            max_seq = pm.seq;
+        };
+        i = i + 1;
+    }
     let iinfo = DbTableInfo { row_count: 0, segment_count: 0, epoch: 0, locked: 0 };
-    let ist = sa_db_insert_row(root, root_len, STR_PTR("messages"), STR_LEN("messages"), &mrow, 32, &iinfo);
+    let ist = sa_db_tx_insert_rows(tx, rows, n * 32, n, &iinfo);
     if ist != 0 {
+        sa_db_tx_rollback(tx);
         println("scodex-mini: session save failed");
         return false;
     };
-    // Keep the sessions row's msg_count in sync (needed for --list).
-    if session_bump(session_id, seq + 1) != true {
+    let cinfo = DbTableInfo { row_count: 0, segment_count: 0, epoch: 0, locked: 0 };
+    if sa_db_tx_commit(tx, &cinfo) != 0 {
+        println("scodex-mini: session save failed");
+        return false;
+    };
+    // Single bump with the final count (was: one bump per message).
+    if session_bump(session_id, max_seq + 1) != true {
         return false;
     };
     return true;
