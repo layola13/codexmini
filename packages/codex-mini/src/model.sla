@@ -225,6 +225,7 @@ fn mini_model_build_request(
     sa_json_writer_new(0, 1, 0, 0, 0, &w);
     sa_json_writer_begin_object(w);
     sa_json_writer_field_string(w, STR_PTR("model"), STR_LEN("model"), cfg.model_ptr, cfg.model_len);
+    sa_json_writer_field_bool(w, STR_PTR("stream"), STR_LEN("stream"), 1);
     if skills_len > 0 {
         sa_json_writer_field_string(w, STR_PTR("instructions"), STR_LEN("instructions"), skills_ptr, skills_len);
     };
@@ -320,6 +321,7 @@ fn mini_model_build_request_chat(
     sa_json_writer_new(0, 1, 0, 0, 0, &w);
     sa_json_writer_begin_object(w);
     sa_json_writer_field_string(w, STR_PTR("model"), STR_LEN("model"), cfg.model_ptr, cfg.model_len);
+    sa_json_writer_field_bool(w, STR_PTR("stream"), STR_LEN("stream"), 1);
     sa_json_writer_object_field(w, STR_PTR("messages"), STR_LEN("messages"));
     sa_json_writer_begin_array(w);
     if skills_len > 0 {
@@ -712,25 +714,45 @@ fn mini_model_run_conversation(
         let body_ref = sa_json_buffer_data(json_buf);
         let body_ptr: ptr = body_ref;
         let body_len = sa_json_buffer_len(json_buf);
-        let resp = mini_http_post_json(url_ptr, url_len, body_ptr, body_len, cfg.api_key_ptr, cfg.api_key_len);
-        if resp.ok != true {
-            println("scodex-mini: http request failed");
+        // SSE streaming turn (native plugin does POST + event parsing + live print).
+        let sse_text_ptr: ptr = PTR_NULL();
+        var sse_text_len: u64;
+        sse_text_len = 0;
+        let sse_calls_ptr: ptr = PTR_NULL();
+        var sse_calls_len: u64;
+        sse_calls_len = 0;
+        let sse_rc = sa_http_client_sse_turn(url_ptr, url_len, body_ptr, body_len, cfg.api_key_ptr, cfg.api_key_len, cfg.api_mode, &sse_text_ptr, &sse_text_len, &sse_calls_ptr, &sse_calls_len);
+        if sse_rc == 2 {
+            println("scodex-mini: sse request failed");
             return 1;
         };
-        if resp.status != 200 {
-            println("scodex-mini: http status={}", resp.status);
-            return 1;
+        // Build outcome from native result. Text was already streamed live.
+        let outcome = mini_turn_outcome_failed(0);
+        outcome.kind = MiniEventKind::TextDelta;
+        outcome.text_ptr = sse_text_ptr;
+        outcome.text_len = sse_text_len;
+        outcome.error_code = 0;
+        if sse_rc == 1 {
+            // Tool calls: parse the JSON array from native.
+            outcome.kind = MiniEventKind::ToolCall;
+            outcome.calls = mini_sse_parse_calls_json(sse_calls_ptr, sse_calls_len);
         };
-        let outcome = mini_model_parse_response_dispatch(cfg.api_mode, resp.body_ptr, resp.body_len);
+        // NOTE: sse_text_ptr and sse_calls_ptr must stay alive through the match
+        // below (outcome.text_ptr and outcome.calls reference them). Freed at
+        // end of loop iteration.
         match outcome.kind {
             MiniEventKind::Failed => {
                 println("scodex-mini: response parse failed code={}", outcome.error_code);
+                sa_http_client_sse_turn_free(sse_text_ptr, sse_text_len);
+                sa_http_client_sse_turn_free(sse_calls_ptr, sse_calls_len);
                 return 1;
             },
             MiniEventKind::TextDelta => {
-                sa_print_bytes(outcome.text_ptr, outcome.text_len);
-                println("");
-                if session_add_message(session_id, seq, 1, outcome.text_ptr, outcome.text_len) != true {
+                // Text was already streamed live by native sse_turn; just save.
+                let save_ok = session_add_message(session_id, seq, 1, outcome.text_ptr, outcome.text_len);
+                sa_http_client_sse_turn_free(sse_text_ptr, sse_text_len);
+                sa_http_client_sse_turn_free(sse_calls_ptr, sse_calls_len);
+                if save_ok != true {
                     println("scodex-mini: session save failed");
                     return 1;
                 };
@@ -834,13 +856,19 @@ fn mini_model_run_conversation(
                 }
             },
             MiniEventKind::TurnDone => {
-                if session_bump(session_id, seq) != true {
+                let bump_ok = session_bump(session_id, seq);
+                sa_http_client_sse_turn_free(sse_text_ptr, sse_text_len);
+                sa_http_client_sse_turn_free(sse_calls_ptr, sse_calls_len);
+                if bump_ok != true {
                     println("scodex-mini: session save failed");
                     return 1;
                 };
                 return 0;
             },
         };
+        // Free SSE buffers now that outcome is fully consumed.
+        sa_http_client_sse_turn_free(sse_text_ptr, sse_text_len);
+        sa_http_client_sse_turn_free(sse_calls_ptr, sse_calls_len);
         turn = turn + 1;
     }
     if session_bump(session_id, seq) != true {
@@ -1351,4 +1379,51 @@ fn session_resume_load(session_id: u64) -> (u64, u64, Vec<MiniInputItem>) {
     }
     sa_db_close_read_table(mh);
     return (0, next_seq, items);
+}
+
+// Parses native sse_turn calls JSON: [{"call_id":"...","name":"...","args":"..."}]
+fn mini_sse_parse_calls_json(calls_ptr: ptr, calls_len: u64) -> Vec<MiniToolCall> {
+    let out: Vec<MiniToolCall> = Vec::new();
+    if calls_ptr == PTR_NULL() || calls_len == 0 {
+        return out;
+    };
+    let root = JSON_PARSE(calls_ptr, calls_len);
+    if root == PTR_NULL() {
+        return out;
+    };
+    let nslot: u64 = 0;
+    if sa_json_value_count(root, &nslot) != 0 {
+        return out;
+    };
+    let n = nslot;
+    var i: u64;
+    i = 0;
+    while i < n {
+        let eslot: ptr = PTR_NULL();
+        if sa_json_array_get(root, i, &eslot) == 0 {
+            let elem = eslot;
+            let call = mini_tool_call_empty();
+            let cid_key = STR_PTR("call_id");
+            let cid_key_len = STR_LEN("call_id");
+            let nm_key = STR_PTR("name");
+            let nm_key_len = STR_LEN("name");
+            let ag_key = STR_PTR("args");
+            let ag_key_len = STR_LEN("args");
+            if X_OBJ_HAS(elem, cid_key, cid_key_len) == true {
+                call.call_id_ptr = X_OBJ_STR_PTR(elem, cid_key, cid_key_len);
+                call.call_id_len = X_OBJ_STR_LEN(elem, cid_key, cid_key_len);
+            };
+            if X_OBJ_HAS(elem, nm_key, nm_key_len) == true {
+                call.name_ptr = X_OBJ_STR_PTR(elem, nm_key, nm_key_len);
+                call.name_len = X_OBJ_STR_LEN(elem, nm_key, nm_key_len);
+            };
+            if X_OBJ_HAS(elem, ag_key, ag_key_len) == true {
+                call.args_ptr = X_OBJ_STR_PTR(elem, ag_key, ag_key_len);
+                call.args_len = X_OBJ_STR_LEN(elem, ag_key, ag_key_len);
+            };
+            out.push(call);
+        };
+        i = i + 1;
+    }
+    return out;
 }
