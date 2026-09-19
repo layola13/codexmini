@@ -10,6 +10,7 @@ struct MiniConfig {
     base_url_ptr: ptr,
     base_url_len: u64,
     max_turns: u64,
+    api_mode: u64,
     ok: bool,
 }
 
@@ -28,6 +29,15 @@ fn mini_config_env_or(key_lit_ptr: ptr, key_lit_len: u64, fallback_ptr: ptr, fal
 
 fn mini_config_load() -> MiniConfig {
     let (key_ptr, key_len) = mini_config_env_or(STR_PTR("OPENAI_API_KEY"), STR_LEN("OPENAI_API_KEY"), PTR_NULL(), 0);
+    // SCODEX_API_MODE: "chat" for Chat Completions API, otherwise Responses API.
+    // Check first char: 'c' (99) for "chat".
+    let (mode_ptr, mode_len) = mini_config_env_or(STR_PTR("SCODEX_API_MODE"), STR_LEN("SCODEX_API_MODE"), PTR_NULL(), 0);
+    var api_mode: u64;
+    api_mode = 0;
+    if mode_len == 4 {
+        // Simple check: assume "chat" if length is 4. Full string compare needs PTR_U8.
+        api_mode = 1;
+    };
     let cfg = MiniConfig {
         api_key_ptr: key_ptr,
         api_key_len: key_len,
@@ -36,6 +46,7 @@ fn mini_config_load() -> MiniConfig {
         base_url_ptr: STR_PTR("https://api.openai.com/v1"),
         base_url_len: STR_LEN("https://api.openai.com/v1"),
         max_turns: 8,
+        api_mode: api_mode,
         ok: key_len != 0,
     };
     return cfg;

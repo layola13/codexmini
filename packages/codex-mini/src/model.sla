@@ -101,7 +101,7 @@ fn mini_model_build_request(cfg: MiniConfig, items: Vec<MiniInputItem>) -> ptr {
     let w: ptr = PTR_NULL();
     sa_json_writer_new(0, 1, 0, 0, 0, &w);
     sa_json_writer_begin_object(w);
-    sa_json_writer_field_string(w, STR_PTR("model"), STR_LEN("model"), STR_PTR("gpt-5"), STR_LEN("gpt-5"));
+    sa_json_writer_field_string(w, STR_PTR("model"), STR_LEN("model"), cfg.model_ptr, cfg.model_len);
     sa_json_writer_object_field(w, STR_PTR("input"), STR_LEN("input"));
     sa_json_writer_begin_array(w);
     let n: u64 = items.len();
@@ -170,8 +170,104 @@ fn mini_model_build_request(cfg: MiniConfig, items: Vec<MiniInputItem>) -> ptr {
     return buf;
 }
 
+// Chat Completions API request builder.
+// Format: {"model": "...", "messages": [...], "tools": [...]}
+fn mini_model_build_request_chat(cfg: MiniConfig, items: Vec<MiniInputItem>) -> ptr {
+    let w: ptr = PTR_NULL();
+    sa_json_writer_new(0, 1, 0, 0, 0, &w);
+    sa_json_writer_begin_object(w);
+    sa_json_writer_field_string(w, STR_PTR("model"), STR_LEN("model"), cfg.model_ptr, cfg.model_len);
+    sa_json_writer_object_field(w, STR_PTR("messages"), STR_LEN("messages"));
+    sa_json_writer_begin_array(w);
+    let n: u64 = items.len();
+    let i: u64 = 0;
+    while i < n {
+        let item = items[i];
+        sa_json_writer_begin_object(w);
+        match item.kind {
+            MiniInputKind::UserText => {
+                sa_json_writer_field_string(w, STR_PTR("role"), STR_LEN("role"), STR_PTR("user"), STR_LEN("user"));
+                sa_json_writer_field_string(w, STR_PTR("content"), STR_LEN("content"), item.text_ptr, item.text_len);
+            },
+            MiniInputKind::AssistantText => {
+                sa_json_writer_field_string(w, STR_PTR("role"), STR_LEN("role"), STR_PTR("assistant"), STR_LEN("assistant"));
+                sa_json_writer_field_string(w, STR_PTR("content"), STR_LEN("content"), item.text_ptr, item.text_len);
+            },
+            MiniInputKind::FuncCall => {
+                sa_json_writer_field_string(w, STR_PTR("role"), STR_LEN("role"), STR_PTR("assistant"), STR_LEN("assistant"));
+                sa_json_writer_object_field(w, STR_PTR("content"), STR_LEN("content"));
+                sa_json_writer_write_null(w);
+                sa_json_writer_object_field(w, STR_PTR("tool_calls"), STR_LEN("tool_calls"));
+                sa_json_writer_begin_array(w);
+                sa_json_writer_begin_object(w);
+                sa_json_writer_field_string(w, STR_PTR("id"), STR_LEN("id"), item.call_id_ptr, item.call_id_len);
+                sa_json_writer_field_string(w, STR_PTR("type"), STR_LEN("type"), STR_PTR("function"), STR_LEN("function"));
+                sa_json_writer_object_field(w, STR_PTR("function"), STR_LEN("function"));
+                sa_json_writer_begin_object(w);
+                sa_json_writer_field_string(w, STR_PTR("name"), STR_LEN("name"), item.name_ptr, item.name_len);
+                sa_json_writer_field_string(w, STR_PTR("arguments"), STR_LEN("arguments"), item.args_ptr, item.args_len);
+                sa_json_writer_end_object(w);
+                sa_json_writer_end_object(w);
+                sa_json_writer_end_array(w);
+            },
+            MiniInputKind::FuncOutput => {
+                sa_json_writer_field_string(w, STR_PTR("role"), STR_LEN("role"), STR_PTR("tool"), STR_LEN("tool"));
+                sa_json_writer_field_string(w, STR_PTR("tool_call_id"), STR_LEN("tool_call_id"), item.call_id_ptr, item.call_id_len);
+                sa_json_writer_field_string(w, STR_PTR("content"), STR_LEN("content"), item.text_ptr, item.text_len);
+            },
+        };
+        sa_json_writer_end_object(w);
+        i = i + 1;
+    }
+    sa_json_writer_end_array(w);
+    sa_json_writer_object_field(w, STR_PTR("tools"), STR_LEN("tools"));
+    sa_json_writer_begin_array(w);
+    sa_json_writer_begin_object(w);
+    sa_json_writer_field_string(w, STR_PTR("type"), STR_LEN("type"), STR_PTR("function"), STR_LEN("function"));
+    sa_json_writer_object_field(w, STR_PTR("function"), STR_LEN("function"));
+    sa_json_writer_begin_object(w);
+    sa_json_writer_field_string(w, STR_PTR("name"), STR_LEN("name"), STR_PTR("shell_exec"), STR_LEN("shell_exec"));
+    sa_json_writer_field_string(w, STR_PTR("description"), STR_LEN("description"), STR_PTR("Run a shell command via sh -c and return its stdout."), STR_LEN("Run a shell command via sh -c and return its stdout."));
+    sa_json_writer_object_field(w, STR_PTR("parameters"), STR_LEN("parameters"));
+    sa_json_writer_begin_object(w);
+    sa_json_writer_field_string(w, STR_PTR("type"), STR_LEN("type"), STR_PTR("object"), STR_LEN("object"));
+    sa_json_writer_object_field(w, STR_PTR("properties"), STR_LEN("properties"));
+    sa_json_writer_begin_object(w);
+    sa_json_writer_object_field(w, STR_PTR("command"), STR_LEN("command"));
+    sa_json_writer_begin_object(w);
+    sa_json_writer_field_string(w, STR_PTR("type"), STR_LEN("type"), STR_PTR("string"), STR_LEN("string"));
+    sa_json_writer_field_string(w, STR_PTR("description"), STR_LEN("description"), STR_PTR("Shell command to run."), STR_LEN("Shell command to run."));
+    sa_json_writer_end_object(w);
+    sa_json_writer_end_object(w);
+    sa_json_writer_object_field(w, STR_PTR("required"), STR_LEN("required"));
+    sa_json_writer_begin_array(w);
+    sa_json_writer_write_string(w, STR_PTR("command"), STR_LEN("command"));
+    sa_json_writer_end_array(w);
+    sa_json_writer_end_object(w);
+    sa_json_writer_end_object(w);
+    sa_json_writer_end_object(w);
+    sa_json_writer_end_array(w);
+    sa_json_writer_end_object(w);
+    let buf = sa_json_writer_finish_buffer(w);
+    sa_json_writer_free(w);
+    return buf;
+}
+
+// Dispatch to mode-specific request builder.
+fn mini_model_build_request_dispatch(cfg: MiniConfig, items: Vec<MiniInputItem>) -> ptr {
+    if cfg.api_mode == 1 {
+        return mini_model_build_request_chat(cfg, items);
+    };
+    return mini_model_build_request(cfg, items);
+}
+
 fn mini_model_build_url(cfg: MiniConfig) -> (ptr, u64) {
-    // Minimal: use default URL. Custom base_url support needs heap alloc.
+    // Mode-aware URL. Uses official OpenAI API endpoints.
+    if cfg.api_mode == 1 {
+        let url_ptr = STR_PTR("https://api.openai.com/v1/chat/completions");
+        let url_len = STR_LEN("https://api.openai.com/v1/chat/completions");
+        return (url_ptr, url_len);
+    };
     let url_ptr = STR_PTR("https://api.openai.com/v1/responses");
     let url_len = STR_LEN("https://api.openai.com/v1/responses");
     return (url_ptr, url_len);
@@ -271,6 +367,107 @@ fn mini_model_parse_response(body_ptr: ptr, body_len: u64) -> MiniTurnOutcome {
 }
 
 
+
+// Parses a non-streaming /v1/chat/completions JSON body into a turn outcome.
+// Format: {"choices": [{"message": {"content": "...", "tool_calls": [...]}}]}
+fn mini_model_parse_response_chat(body_ptr: ptr, body_len: u64) -> MiniTurnOutcome {
+    let outcome = mini_turn_outcome_failed(6001);
+    let root = JSON_PARSE(body_ptr, body_len);
+    if root == PTR_NULL() {
+        return outcome;
+    };
+    let ckey = STR_PTR("choices");
+    let ckey_len = STR_LEN("choices");
+    if X_OBJ_HAS(root, ckey, ckey_len) != true {
+        outcome.error_code = 6002;
+        return outcome;
+    };
+    let choices_slot: ptr = PTR_NULL();
+    if sa_json_object_get(root, ckey, ckey_len, &choices_slot) != 0 {
+        outcome.error_code = 6002;
+        return outcome;
+    };
+    let c0slot: ptr = PTR_NULL();
+    if sa_json_array_get(choices_slot, 0, &c0slot) != 0 {
+        outcome.error_code = 6003;
+        return outcome;
+    };
+    let mkey = STR_PTR("message");
+    let mkey_len = STR_LEN("message");
+    if X_OBJ_HAS(c0slot, mkey, mkey_len) != true {
+        outcome.error_code = 6004;
+        return outcome;
+    };
+    let msg_slot: ptr = PTR_NULL();
+    if sa_json_object_get(c0slot, mkey, mkey_len, &msg_slot) != 0 {
+        outcome.error_code = 6004;
+        return outcome;
+    };
+    let msg = msg_slot;
+    let tckey = STR_PTR("tool_calls");
+    let tckey_len = STR_LEN("tool_calls");
+    if X_OBJ_HAS(msg, tckey, tckey_len) == true {
+        let tc_slot: ptr = PTR_NULL();
+        if sa_json_object_get(msg, tckey, tckey_len, &tc_slot) == 0 {
+            let tc0slot: ptr = PTR_NULL();
+            if sa_json_array_get(tc_slot, 0, &tc0slot) == 0 {
+                let idkey = STR_PTR("id");
+                let idkey_len = STR_LEN("id");
+                let fkey = STR_PTR("function");
+                let fkey_len = STR_LEN("function");
+                if X_OBJ_HAS(tc0slot, idkey, idkey_len) == true {
+                    if X_OBJ_HAS(tc0slot, fkey, fkey_len) == true {
+                        let fslot: ptr = PTR_NULL();
+                        if sa_json_object_get(tc0slot, fkey, fkey_len, &fslot) == 0 {
+                            let nkey = STR_PTR("name");
+                            let nkey_len = STR_LEN("name");
+                            let akey = STR_PTR("arguments");
+                            let akey_len = STR_LEN("arguments");
+                            if X_OBJ_HAS(fslot, nkey, nkey_len) == true {
+                                if X_OBJ_HAS(fslot, akey, akey_len) == true {
+                                    let call = mini_tool_call_empty();
+                                    call.call_id_ptr = X_OBJ_STR_PTR(tc0slot, idkey, idkey_len);
+                                    call.call_id_len = X_OBJ_STR_LEN(tc0slot, idkey, idkey_len);
+                                    call.name_ptr = X_OBJ_STR_PTR(fslot, nkey, nkey_len);
+                                    call.name_len = X_OBJ_STR_LEN(fslot, nkey, nkey_len);
+                                    call.args_ptr = X_OBJ_STR_PTR(fslot, akey, akey_len);
+                                    call.args_len = X_OBJ_STR_LEN(fslot, akey, akey_len);
+                                    outcome.calls.push(call);
+                                    outcome.kind = MiniEventKind::ToolCall;
+                                    return outcome;
+                                };
+                            };
+                        };
+                    };
+                };
+            };
+        };
+    };
+    let cokey = STR_PTR("content");
+    let cokey_len = STR_LEN("content");
+    if X_OBJ_HAS(msg, cokey, cokey_len) == true {
+        let co_ptr = X_OBJ_STR_PTR(msg, cokey, cokey_len);
+        let co_len = X_OBJ_STR_LEN(msg, cokey, cokey_len);
+        if co_ptr != PTR_NULL() {
+            outcome.kind = MiniEventKind::TextDelta;
+            outcome.text_ptr = co_ptr;
+            outcome.text_len = co_len;
+            return outcome;
+        };
+    };
+    outcome.kind = MiniEventKind::TurnDone;
+    outcome.error_code = 0;
+    return outcome;
+}
+
+// Dispatch to mode-specific response parser.
+fn mini_model_parse_response_dispatch(mode: u64, body_ptr: ptr, body_len: u64) -> MiniTurnOutcome {
+    if mode == 1 {
+        return mini_model_parse_response_chat(body_ptr, body_len);
+    };
+    return mini_model_parse_response(body_ptr, body_len);
+}
+
 // Extracts the "command" argument from a function_call arguments JSON object.
 fn mini_model_tool_command(args_ptr: ptr, args_len: u64) -> (ptr, u64, bool) {
     let root = JSON_PARSE(args_ptr, args_len);
@@ -300,7 +497,7 @@ fn mini_model_run_conversation(
     let (url_ptr, url_len) = mini_model_build_url(cfg);
     let turn: u64 = 0;
     while turn < cfg.max_turns {
-        let json_buf = mini_model_build_request(cfg, items);
+        let json_buf = mini_model_build_request_dispatch(cfg, items);
         if json_buf == PTR_NULL() {
             println("scodex-mini: failed to build request");
             return 1;
@@ -317,7 +514,7 @@ fn mini_model_run_conversation(
             println("scodex-mini: http status={}", resp.status);
             return 1;
         };
-        let outcome = mini_model_parse_response(resp.body_ptr, resp.body_len);
+        let outcome = mini_model_parse_response_dispatch(cfg.api_mode, resp.body_ptr, resp.body_len);
         match outcome.kind {
             MiniEventKind::Failed => {
                 println("scodex-mini: response parse failed code={}", outcome.error_code);
