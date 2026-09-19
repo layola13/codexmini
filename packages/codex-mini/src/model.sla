@@ -329,15 +329,21 @@ fn mini_model_build_request_dispatch(cfg: MiniConfig, items: Vec<MiniInputItem>)
 }
 
 fn mini_model_build_url(cfg: MiniConfig) -> (ptr, u64) {
-    // Mode-aware URL. Uses official OpenAI API endpoints.
+    // Mode-aware URL. Appends the endpoint path to cfg.base_url.
+    var suffix_ptr: ptr;
+    var suffix_len: u64;
     if cfg.api_mode == 1 {
-        let url_ptr = STR_PTR("https://api.openai.com/v1/chat/completions");
-        let url_len = STR_LEN("https://api.openai.com/v1/chat/completions");
-        return (url_ptr, url_len);
+        suffix_ptr = STR_PTR("/chat/completions");
+        suffix_len = STR_LEN("/chat/completions");
+    } else {
+        suffix_ptr = STR_PTR("/responses");
+        suffix_len = STR_LEN("/responses");
     };
-    let url_ptr = STR_PTR("https://api.openai.com/v1/responses");
-    let url_len = STR_LEN("https://api.openai.com/v1/responses");
-    return (url_ptr, url_len);
+    let total = cfg.base_url_len + suffix_len;
+    let out = X_HEAP_BUF_PTR(total);
+    X_COPY_BYTES(out, cfg.base_url_ptr, cfg.base_url_len);
+    X_COPY_BYTES(X_PTR_ADD(out, cfg.base_url_len), suffix_ptr, suffix_len);
+    return (out, total);
 }
 
 // Parses a non-streaming /v1/responses JSON body into a turn outcome.
