@@ -1,0 +1,162 @@
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "slicex.sa"
+@import "sa_std/core/slice.sa"
+@import "sa_std/io/print.sai"
+@import "sa_std/env.sa"
+
+// Skills support: loads SKILL.md files from the skills directory into
+// system instructions.
+// Directory: $SCODEX_SKILLS_DIR, or $HOME/.scodex-mini/skills by default.
+// Layout: <skills_dir>/<skill_name>/SKILL.md
+
+fn mini_skills_dir() -> (ptr, u64) {
+    // SCODEX_SKILLS_DIR override.
+    let st = sa_env_has(STR_PTR("SCODEX_SKILLS_DIR"), STR_LEN("SCODEX_SKILLS_DIR"));
+    if st == 0 {
+        let buf = ENV_GET_PTR(STR_PTR("SCODEX_SKILLS_DIR"), STR_LEN("SCODEX_SKILLS_DIR"));
+        let len = ENV_BUFFER_LEN(buf);
+        if len != 0 {
+            let dref = ENV_BUFFER_DATA(buf);
+            let dptr: ptr = dref;
+            return (dptr, len);
+        };
+    };
+    // $HOME/.scodex-mini/skills
+    let home_h = sa_env_home_dir();
+    let home_ref = sa_env_buffer_data(home_h);
+    let home_ptr: ptr = home_ref;
+    let home_len = sa_env_buffer_len(home_h);
+    let suffix = STR_PTR("/.scodex-mini/skills");
+    let suffix_len = STR_LEN("/.scodex-mini/skills");
+    let total = home_len + suffix_len;
+    let out = X_HEAP_BUF_PTR(total);
+    X_COPY_BYTES(out, home_ptr, home_len);
+    X_COPY_BYTES(X_PTR_ADD(out, home_len), suffix, suffix_len);
+    return (out, total);
+}
+
+// Build "<dir>/<name>/SKILL.md" path.
+fn mini_skill_md_path(dir_ptr: ptr, dir_len: u64, name_ptr: ptr, name_len: u64) -> (ptr, u64) {
+    let mid = STR_PTR("/");
+    let mid_len = STR_LEN("/");
+    let tail = STR_PTR("/SKILL.md");
+    let tail_len = STR_LEN("/SKILL.md");
+    let total = dir_len + mid_len + name_len + tail_len;
+    let out = X_HEAP_BUF_PTR(total);
+    var off: u64;
+    off = 0;
+    X_COPY_BYTES(X_PTR_ADD(out, off), dir_ptr, dir_len);
+    off = off + dir_len;
+    X_COPY_BYTES(X_PTR_ADD(out, off), mid, mid_len);
+    off = off + mid_len;
+    X_COPY_BYTES(X_PTR_ADD(out, off), name_ptr, name_len);
+    off = off + name_len;
+    X_COPY_BYTES(X_PTR_ADD(out, off), tail, tail_len);
+    return (out, total);
+}
+
+// Load all skills. Returns (instructions_ptr, instructions_len, ok).
+// ok=false when no skills found (not an error).
+fn mini_skills_load() -> (ptr, u64, bool) {
+    let (dir_ptr, dir_len) = mini_skills_dir();
+    let entries: u64 = 0;
+    let st: i32 = sa_std_fs_read_dir_entries(dir_ptr, dir_len, 64, &entries);
+    if st != 0 {
+        return (PTR_NULL(), 0, false);
+    };
+    let n = sa_fs_dir_entries_len(entries);
+    if n == 0 {
+        return (PTR_NULL(), 0, false);
+    };
+    // First pass: read each SKILL.md, collect (name, content) pairs.
+    // Use fixed-size arrays on stack via heap buffers.
+    let max_skills: u64 = 64;
+    let name_ptrs = X_HEAP_BUF_PTR(max_skills * 8);
+    let name_lens = X_HEAP_BUF_PTR(max_skills * 8);
+    let body_ptrs = X_HEAP_BUF_PTR(max_skills * 8);
+    let body_lens = X_HEAP_BUF_PTR(max_skills * 8);
+    var count: u64;
+    count = 0;
+    var total: u64;
+    total = 0;
+    let i: u64 = 0;
+    while i < n {
+        if count < max_skills {
+            let entry: u64 = 0;
+            if sa_std_fs_dir_entries_get(entries, i, &entry) == 0 {
+                let kind = sa_fs_dir_entry_kind(entry);
+                if kind == 2 {
+                    let nref = sa_fs_dir_entry_name_ptr(entry);
+                    let nptr: ptr = nref;
+                    let nlen = sa_fs_dir_entry_name_len(entry);
+                    // Skip "." and "..".
+                    if nlen > 2 {
+                        let (md_ptr, md_len) = mini_skill_md_path(dir_ptr, dir_len, nptr, nlen);
+                        let fbuf: u64 = 0;
+                        // 256 KiB max per SKILL.md.
+                        if sa_std_fs_read_to_string(md_ptr, md_len, 262144, &fbuf) == 0 {
+                            let blen = sa_fs_read_buffer_len(fbuf);
+                            if blen > 0 {
+                                let bref = sa_fs_read_buffer_data(fbuf);
+                                let bptr: ptr = bref;
+                                // Store name (copy, entry will be freed).
+                                let nc = X_HEAP_BUF_PTR(nlen);
+                                X_COPY_BYTES(nc, nptr, nlen);
+                                X_STORE_U64(X_PTR_ADD(name_ptrs, count * 8), nc);
+                                X_STORE_U64(X_PTR_ADD(name_lens, count * 8), nlen);
+                                X_STORE_U64(X_PTR_ADD(body_ptrs, count * 8), bptr);
+                                X_STORE_U64(X_PTR_ADD(body_lens, count * 8), blen);
+                                // "# Skill: <name>\n<body>\n\n"
+                                total = total + 10 + nlen + 1 + blen + 2;
+                                count = count + 1;
+                            };
+                        };
+                    };
+                };
+                sa_fs_dir_entry_free(entry);
+            };
+        };
+        i = i + 1;
+    }
+    if count == 0 {
+        return (PTR_NULL(), 0, false);
+    };
+    // Header: "Available skills:\n\n"
+    let header = STR_PTR("Available skills:\n\n");
+    let header_len = STR_LEN("Available skills:\n\n");
+    total = total + header_len;
+    let out = X_HEAP_BUF_PTR(total);
+    var off: u64;
+    off = 0;
+    X_COPY_BYTES(X_PTR_ADD(out, off), header, header_len);
+    off = off + header_len;
+    let j: u64 = 0;
+    while j < count {
+        let np = X_LOAD_U64(X_PTR_ADD(name_ptrs, j * 8));
+        let nl = X_LOAD_U64(X_PTR_ADD(name_lens, j * 8));
+        let bp = X_LOAD_U64(X_PTR_ADD(body_ptrs, j * 8));
+        let bl = X_LOAD_U64(X_PTR_ADD(body_lens, j * 8));
+        let h1 = STR_PTR("# Skill: ");
+        X_COPY_BYTES(X_PTR_ADD(out, off), h1, 9);
+        off = off + 9;
+        X_COPY_BYTES(X_PTR_ADD(out, off), np, nl);
+        off = off + nl;
+        X_STORE_U8(X_PTR_ADD(out, off), 10);
+        off = off + 1;
+        X_COPY_BYTES(X_PTR_ADD(out, off), bp, bl);
+        off = off + bl;
+        X_STORE_U8(X_PTR_ADD(out, off), 10);
+        off = off + 1;
+        X_STORE_U8(X_PTR_ADD(out, off), 10);
+        off = off + 2;
+        j = j + 1;
+    }
+    return (out, total, true);
+}
+
+@test "skills dir default suffix"() {
+    let (p, l) = mini_skills_dir();
+    if l == 0 { panic(501); };
+    if p == PTR_NULL() { panic(502); };
+}

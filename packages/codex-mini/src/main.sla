@@ -42,31 +42,13 @@ fn mini_cli_arg(idx: u64) -> (ptr, u64, bool) {
 }
 
 fn mini_cli_join_argv() -> (ptr, u64, bool) {
-    let argc = ENV_ARGS_JSON();
-    if argc == 0 {
-        return (PTR_NULL(), 0, false);
-    };
-    let root = JSON_PARSE(ENV_BUFFER_DATA(argc), ENV_BUFFER_LEN(argc));
-    if root == PTR_NULL() {
-        return (PTR_NULL(), 0, false);
-    };
-    // Get argv[1] via extern (avoid macro chaining)
-    let item_slot: ptr = PTR_NULL();
-    let st = sa_json_array_get(root, 1, &item_slot);
-    if st != 0 {
-        return (PTR_NULL(), 0, false);
-    };
-    let item = item_slot;
-    if item == PTR_NULL() {
-        return (PTR_NULL(), 0, false);
-    };
-    let sptr_ref = sa_json_string_ptr(item);
-    let pptr: ptr = sptr_ref;
-    let plen = sa_json_string_len(item);
-    if plen == 0 {
-        return (PTR_NULL(), 0, false);
-    };
-    return (pptr, plen, true);
+    return mini_cli_join_from(1);
+}
+
+// mini_cli_join_from(from): joins argv[from..] — used for the
+// default prompt after optional --mcp prefix shifting.
+fn mini_cli_join_from(from: u64) -> (ptr, u64, bool) {
+    return mini_cli_join_range(from);
 }
 
 // mini_cli_arg(idx): argv[idx] as (ptr, len, ok). ok=false when missing,
@@ -168,6 +150,10 @@ fn mini_cli_join_range(from: u64) -> (ptr, u64, bool) {
 // mini_cli_run_image(path_idx): scodex-mini --image <path> <prompt...>
 // Loads the image as base64 and sends it as multimodal input.
 fn mini_cli_run_image(path_idx: u64) -> i32 {
+    return mini_cli_run_image_mcp(path_idx, PTR_NULL(), 0);
+}
+
+fn mini_cli_run_image_mcp(path_idx: u64, mcp_ptr: ptr, mcp_len: u64) -> i32 {
     let (ppp, ppl, ppok) = mini_cli_arg(path_idx);
     if ppok != true {
         println("usage: scodex-mini --image <path> <prompt>");
@@ -178,11 +164,12 @@ fn mini_cli_run_image(path_idx: u64) -> i32 {
         println("usage: scodex-mini --image <path> <prompt>");
         return 2;
     };
-    let cfg = mini_config_load();
-    if cfg.ok != true {
+    let cfg0 = mini_config_load();
+    if cfg0.ok != true {
         println("scodex-mini: missing OPENAI_API_KEY");
         return 2;
     };
+    let cfg = mini_config_apply_mcp(cfg0, mcp_ptr, mcp_len);
     let (b64p, b64l, bufh, mptr, mlen, iok) = mini_image_load(ppp, ppl);
     if iok != true {
         return 1;
@@ -211,6 +198,10 @@ fn mini_cli_run_image(path_idx: u64) -> i32 {
 // mini_cli_run_file(path_idx): scodex-mini --file <path> <prompt...>
 // Injects the text file's contents into the prompt as context.
 fn mini_cli_run_file(path_idx: u64) -> i32 {
+    return mini_cli_run_file_mcp(path_idx, PTR_NULL(), 0);
+}
+
+fn mini_cli_run_file_mcp(path_idx: u64, mcp_ptr: ptr, mcp_len: u64) -> i32 {
     let (ppp, ppl, ppok) = mini_cli_arg(path_idx);
     if ppok != true {
         println("usage: scodex-mini --file <path> <prompt>");
@@ -221,11 +212,12 @@ fn mini_cli_run_file(path_idx: u64) -> i32 {
         println("usage: scodex-mini --file <path> <prompt>");
         return 2;
     };
-    let cfg = mini_config_load();
-    if cfg.ok != true {
+    let cfg0 = mini_config_load();
+    if cfg0.ok != true {
         println("scodex-mini: missing OPENAI_API_KEY");
         return 2;
     };
+    let cfg = mini_config_apply_mcp(cfg0, mcp_ptr, mcp_len);
     let (ftp, ftl, fbufh, fok) = mini_file_load_text(ppp, ppl);
     if fok != true {
         return 1;
@@ -250,13 +242,34 @@ fn mini_cli_run_file(path_idx: u64) -> i32 {
 }
 
 fn main() -> i32 {
+    // Optional prefix: --mcp "<server command>" shifts arg parsing by 2.
+    var arg_base: u64;
+    arg_base = 1;
+    var mcp_ptr: ptr;
+    var mcp_len: u64;
+    mcp_ptr = PTR_NULL();
+    mcp_len = 0;
     let (a1p, a1l, a1ok) = mini_cli_arg(1);
     if a1ok == true {
-        if mini_model_str_eq(a1p, a1l, STR_PTR("--list"), STR_LEN("--list")) == true {
+        if mini_model_str_eq(a1p, a1l, STR_PTR("--mcp"), STR_LEN("--mcp")) == true {
+            let (mcp, mcl, mok) = mini_cli_arg(2);
+            if mok != true {
+                println("usage: scodex-mini --mcp \"<server command>\" <prompt>");
+                println("   or: scodex-mini --mcp \"<server command>\" --image <path> <prompt>");
+                return 2;
+            };
+            mcp_ptr = mcp;
+            mcp_len = mcl;
+            arg_base = 3;
+        };
+    };
+    let (b1p, b1l, b1ok) = mini_cli_arg(arg_base);
+    if b1ok == true {
+        if mini_model_str_eq(b1p, b1l, STR_PTR("--list"), STR_LEN("--list")) == true {
             return session_list();
         };
-        if mini_model_str_eq(a1p, a1l, STR_PTR("--resume"), STR_LEN("--resume")) == true {
-            let (a2p, a2l, a2ok) = mini_cli_arg(2);
+        if mini_model_str_eq(b1p, b1l, STR_PTR("--resume"), STR_LEN("--resume")) == true {
+            let (a2p, a2l, a2ok) = mini_cli_arg(arg_base + 1);
             let sid: u64 = 0;
             let sidok: bool = false;
             if a2ok == true {
@@ -274,16 +287,17 @@ fn main() -> i32 {
                 println("usage: scodex-mini --resume <id> <prompt>");
                 return 2;
             };
-            let (prp, prl, prok) = mini_cli_join_range(3);
+            let (prp, prl, prok) = mini_cli_join_range(arg_base + 2);
             if prok != true {
                 println("usage: scodex-mini --resume <id> <prompt>");
                 return 2;
             };
-            let cfg = mini_config_load();
-            if cfg.ok != true {
+            let cfg0 = mini_config_load();
+            if cfg0.ok != true {
                 println("scodex-mini: missing OPENAI_API_KEY");
                 return 2;
             };
+            let cfg = mini_config_apply_mcp(cfg0, mcp_ptr, mcp_len);
             let (st, next_seq, items) = session_resume_load(sid);
             if st != 0 {
                 return 1;
@@ -295,26 +309,27 @@ fn main() -> i32 {
             items.push(mini_input_user(prp, prl));
             return mini_model_run_conversation(cfg, sid, next_seq + 1, items);
         };
-        if mini_model_str_eq(a1p, a1l, STR_PTR("--image"), STR_LEN("--image")) == true {
-            return mini_cli_run_image(2);
+        if mini_model_str_eq(b1p, b1l, STR_PTR("--image"), STR_LEN("--image")) == true {
+            return mini_cli_run_image_mcp(arg_base + 1, mcp_ptr, mcp_len);
         };
-        if mini_model_str_eq(a1p, a1l, STR_PTR("-i"), STR_LEN("-i")) == true {
-            return mini_cli_run_image(2);
+        if mini_model_str_eq(b1p, b1l, STR_PTR("-i"), STR_LEN("-i")) == true {
+            return mini_cli_run_image_mcp(arg_base + 1, mcp_ptr, mcp_len);
         };
-        if mini_model_str_eq(a1p, a1l, STR_PTR("--file"), STR_LEN("--file")) == true {
-            return mini_cli_run_file(2);
+        if mini_model_str_eq(b1p, b1l, STR_PTR("--file"), STR_LEN("--file")) == true {
+            return mini_cli_run_file_mcp(arg_base + 1, mcp_ptr, mcp_len);
         };
-        if mini_model_str_eq(a1p, a1l, STR_PTR("-f"), STR_LEN("-f")) == true {
-            return mini_cli_run_file(2);
+        if mini_model_str_eq(b1p, b1l, STR_PTR("-f"), STR_LEN("-f")) == true {
+            return mini_cli_run_file_mcp(arg_base + 1, mcp_ptr, mcp_len);
         };
     };
-    let cfg = mini_config_load();
-    if cfg.ok != true {
+    let cfg0 = mini_config_load();
+    if cfg0.ok != true {
         println("scodex-mini: missing OPENAI_API_KEY");
         println("usage: scodex-mini <prompt>");
         return 2;
     };
-    let (prompt_ptr, prompt_len, prompt_ok) = mini_cli_join_argv();
+    let cfg = mini_config_apply_mcp(cfg0, mcp_ptr, mcp_len);
+    let (prompt_ptr, prompt_len, prompt_ok) = mini_cli_join_from(arg_base);
     if prompt_ok != true {
         println("usage: scodex-mini <prompt>");
         return 2;

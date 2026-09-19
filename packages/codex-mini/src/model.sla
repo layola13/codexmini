@@ -12,6 +12,8 @@
 @import "http.sla"
 @import "tools.sla"
 @import "image.sla"
+@import "skills.sla"
+@import "mcp.sla"
 @import "plugin_abi/db.sai"
 @import "sa_std/time.sai"
 @import "sessionx.sa"
@@ -136,14 +138,96 @@ fn mini_model_str_eq(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> bool {
     return X_STR_EQ(a_ptr, a_len, b_ptr, b_len);
 }
 
+// Writes MCP tools (from mini_mcp_list_tools JSON) into the open "tools"
+// array of the request.
+// Responses API format: {"type":"function","name":...,"description":...,"parameters":<inputSchema>}
+// Chat API format: {"type":"function","function":{"name":...,"description":...,"parameters":<inputSchema>}}
+// chat_mode=1 for Chat API, 0 for Responses API.
+// Returns true on success, false if the JSON is unusable (caller continues
+// without MCP tools).
+fn mini_model_write_mcp_tools(w: ptr, mcp_ptr: ptr, mcp_len: u64, chat_mode: u64) -> bool {
+    let root = JSON_PARSE(mcp_ptr, mcp_len);
+    if root == PTR_NULL() {
+        return false;
+    };
+    let tslot: ptr = PTR_NULL();
+    if sa_json_object_get(root, STR_PTR("tools"), STR_LEN("tools"), &tslot) != 0 {
+        return false;
+    };
+    if tslot == PTR_NULL() {
+        return false;
+    };
+    let nslot: u64 = 0;
+    if sa_json_value_count(tslot, &nslot) != 0 {
+        return false;
+    };
+    let n = nslot;
+    let i: u64 = 0;
+    while i < n {
+        let islot: ptr = PTR_NULL();
+        if sa_json_array_get(tslot, i, &islot) == 0 {
+            if islot != PTR_NULL() {
+                let nslot2: ptr = PTR_NULL();
+                if sa_json_object_get(islot, STR_PTR("name"), STR_LEN("name"), &nslot2) == 0 {
+                    if nslot2 != PTR_NULL() {
+                        sa_json_writer_begin_object(w);
+                        sa_json_writer_field_string(w, STR_PTR("type"), STR_LEN("type"), STR_PTR("function"), STR_LEN("function"));
+                        // Chat API nests under "function" key.
+                        if chat_mode == 1 {
+                            sa_json_writer_object_field(w, STR_PTR("function"), STR_LEN("function"));
+                            sa_json_writer_begin_object(w);
+                        };
+                        let nref = sa_json_string_ptr(nslot2);
+                        let nptr: ptr = nref;
+                        let nlen = sa_json_string_len(nslot2);
+                        sa_json_writer_field_string(w, STR_PTR("name"), STR_LEN("name"), nptr, nlen);
+                        let dslot: ptr = PTR_NULL();
+                        if sa_json_object_get(islot, STR_PTR("description"), STR_LEN("description"), &dslot) == 0 {
+                            if dslot != PTR_NULL() {
+                                let dref = sa_json_string_ptr(dslot);
+                                let dptr: ptr = dref;
+                                let dlen = sa_json_string_len(dslot);
+                                sa_json_writer_field_string(w, STR_PTR("description"), STR_LEN("description"), dptr, dlen);
+                            };
+                        };
+                        let sslot: ptr = PTR_NULL();
+                        if sa_json_object_get(islot, STR_PTR("inputSchema"), STR_LEN("inputSchema"), &sslot) == 0 {
+                            if sslot != PTR_NULL() {
+                                sa_json_writer_object_field(w, STR_PTR("parameters"), STR_LEN("parameters"));
+                                sa_json_writer_write_node(w, sslot);
+                            };
+                        };
+                        if chat_mode == 1 {
+                            sa_json_writer_end_object(w);
+                        };
+                        sa_json_writer_end_object(w);
+                    };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    return true;
+}
+
 // Builds the /v1/responses request JSON. Returns (body_ptr, body_len, json_buf);
 // the caller must keep json_buf alive while using the body, then free it with
 // sa_json_buffer_free.
-fn mini_model_build_request(cfg: MiniConfig, items: Vec<MiniInputItem>) -> ptr {
+fn mini_model_build_request(
+    cfg: MiniConfig,
+    items: Vec<MiniInputItem>,
+    skills_ptr: ptr,
+    skills_len: u64,
+    mcp_ptr: ptr,
+    mcp_len: u64
+) -> ptr {
     let w: ptr = PTR_NULL();
     sa_json_writer_new(0, 1, 0, 0, 0, &w);
     sa_json_writer_begin_object(w);
     sa_json_writer_field_string(w, STR_PTR("model"), STR_LEN("model"), cfg.model_ptr, cfg.model_len);
+    if skills_len > 0 {
+        sa_json_writer_field_string(w, STR_PTR("instructions"), STR_LEN("instructions"), skills_ptr, skills_len);
+    };
     sa_json_writer_object_field(w, STR_PTR("input"), STR_LEN("input"));
     sa_json_writer_begin_array(w);
     let n: u64 = items.len();
@@ -212,6 +296,9 @@ fn mini_model_build_request(cfg: MiniConfig, items: Vec<MiniInputItem>) -> ptr {
     sa_json_writer_end_array(w);
     sa_json_writer_end_object(w);
     sa_json_writer_end_object(w);
+    if mcp_len > 0 {
+        mini_model_write_mcp_tools(w, mcp_ptr, mcp_len, 0);
+    };
     sa_json_writer_end_array(w);
     sa_json_writer_end_object(w);
     let buf = sa_json_writer_finish_buffer(w);
@@ -221,13 +308,26 @@ fn mini_model_build_request(cfg: MiniConfig, items: Vec<MiniInputItem>) -> ptr {
 
 // Chat Completions API request builder.
 // Format: {"model": "...", "messages": [...], "tools": [...]}
-fn mini_model_build_request_chat(cfg: MiniConfig, items: Vec<MiniInputItem>) -> ptr {
+fn mini_model_build_request_chat(
+    cfg: MiniConfig,
+    items: Vec<MiniInputItem>,
+    skills_ptr: ptr,
+    skills_len: u64,
+    mcp_ptr: ptr,
+    mcp_len: u64
+) -> ptr {
     let w: ptr = PTR_NULL();
     sa_json_writer_new(0, 1, 0, 0, 0, &w);
     sa_json_writer_begin_object(w);
     sa_json_writer_field_string(w, STR_PTR("model"), STR_LEN("model"), cfg.model_ptr, cfg.model_len);
     sa_json_writer_object_field(w, STR_PTR("messages"), STR_LEN("messages"));
     sa_json_writer_begin_array(w);
+    if skills_len > 0 {
+        sa_json_writer_begin_object(w);
+        sa_json_writer_field_string(w, STR_PTR("role"), STR_LEN("role"), STR_PTR("system"), STR_LEN("system"));
+        sa_json_writer_field_string(w, STR_PTR("content"), STR_LEN("content"), skills_ptr, skills_len);
+        sa_json_writer_end_object(w);
+    };
     let n: u64 = items.len();
     let i: u64 = 0;
     while i < n {
@@ -313,6 +413,9 @@ fn mini_model_build_request_chat(cfg: MiniConfig, items: Vec<MiniInputItem>) -> 
     sa_json_writer_end_object(w);
     sa_json_writer_end_object(w);
     sa_json_writer_end_object(w);
+    if mcp_len > 0 {
+        mini_model_write_mcp_tools(w, mcp_ptr, mcp_len, 1);
+    };
     sa_json_writer_end_array(w);
     sa_json_writer_end_object(w);
     let buf = sa_json_writer_finish_buffer(w);
@@ -321,11 +424,18 @@ fn mini_model_build_request_chat(cfg: MiniConfig, items: Vec<MiniInputItem>) -> 
 }
 
 // Dispatch to mode-specific request builder.
-fn mini_model_build_request_dispatch(cfg: MiniConfig, items: Vec<MiniInputItem>) -> ptr {
+fn mini_model_build_request_dispatch(
+    cfg: MiniConfig,
+    items: Vec<MiniInputItem>,
+    skills_ptr: ptr,
+    skills_len: u64,
+    mcp_ptr: ptr,
+    mcp_len: u64
+) -> ptr {
     if cfg.api_mode == 1 {
-        return mini_model_build_request_chat(cfg, items);
+        return mini_model_build_request_chat(cfg, items, skills_ptr, skills_len, mcp_ptr, mcp_len);
     };
-    return mini_model_build_request(cfg, items);
+    return mini_model_build_request(cfg, items, skills_ptr, skills_len, mcp_ptr, mcp_len);
 }
 
 fn mini_model_build_url(cfg: MiniConfig) -> (ptr, u64) {
@@ -568,9 +678,33 @@ fn mini_model_run_conversation(
     var seq: u64;
     seq = start_seq;
     let (url_ptr, url_len) = mini_model_build_url(cfg);
+    // Load skills once per run (not an error when none exist).
+    let (skills_ptr, skills_len, skills_ok) = mini_skills_load();
+    var eff_skills_ptr: ptr;
+    var eff_skills_len: u64;
+    eff_skills_ptr = PTR_NULL();
+    eff_skills_len = 0;
+    if skills_ok == true {
+        eff_skills_ptr = skills_ptr;
+        eff_skills_len = skills_len;
+    };
+    // List MCP tools once per run when --mcp / SCODEX_MCP is set.
+    var mcp_tools_ptr: ptr;
+    var mcp_tools_len: u64;
+    mcp_tools_ptr = PTR_NULL();
+    mcp_tools_len = 0;
+    if cfg.mcp_cmd_len > 0 {
+        let (mp, ml, mok) = mini_mcp_list_tools(cfg.mcp_cmd_ptr, cfg.mcp_cmd_len);
+        if mok == true {
+            mcp_tools_ptr = mp;
+            mcp_tools_len = ml;
+        } else {
+            println("scodex-mini: warning: mcp tool list failed, continuing without mcp tools");
+        };
+    };
     let turn: u64 = 0;
     while turn < cfg.max_turns {
-        let json_buf = mini_model_build_request_dispatch(cfg, items);
+        let json_buf = mini_model_build_request_dispatch(cfg, items, eff_skills_ptr, eff_skills_len, mcp_tools_ptr, mcp_tools_len);
         if json_buf == PTR_NULL() {
             println("scodex-mini: failed to build request");
             return 1;
@@ -649,6 +783,20 @@ fn mini_model_run_conversation(
                         } else {
                             out_ptr = STR_PTR("(bad arguments)");
                             out_len = STR_LEN("(bad arguments)");
+                        };
+                    } else if cfg.mcp_cmd_len > 0 {
+                        // Route any non-shell tool through the MCP bridge.
+                        let (mcp_out_ptr, mcp_out_len, mcp_ok) = mini_mcp_call_tool(
+                            cfg.mcp_cmd_ptr, cfg.mcp_cmd_len,
+                            call.name_ptr, call.name_len,
+                            call.args_ptr, call.args_len
+                        );
+                        if mcp_ok == true {
+                            out_ptr = mcp_out_ptr;
+                            out_len = mcp_out_len;
+                        } else {
+                            out_ptr = STR_PTR("(mcp call failed)");
+                            out_len = STR_LEN("(mcp call failed)");
                         };
                     } else {
                         out_ptr = STR_PTR("(unknown tool)");

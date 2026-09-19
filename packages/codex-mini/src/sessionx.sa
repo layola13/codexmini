@@ -42,6 +42,16 @@
     store %ptr+0, %val as u8
 [END_MACRO]
 
+// X_LOAD_U64 %out, %ptr — loads a u64 (single output)
+[MACRO] X_LOAD_U64 %out, %ptr
+    %out = load %ptr+0 as u64
+[END_MACRO]
+
+// X_STORE_U64 %ptr, %val — stores a u64
+[MACRO] X_STORE_U64 %ptr, %val
+    store %ptr+0, %val as u64
+[END_MACRO]
+
 // (X_PTR_ADD lives in slicex.sa, imported above — not redefined here.)
 
 // X_ROW_PUT_U64 %buf, %idx, %val — writes u64 at column idx (statement)

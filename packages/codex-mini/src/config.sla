@@ -11,6 +11,8 @@ struct MiniConfig {
     base_url_len: u64,
     max_turns: u64,
     api_mode: u64,
+    mcp_cmd_ptr: ptr,
+    mcp_cmd_len: u64,
     ok: bool,
 }
 
@@ -38,15 +40,30 @@ fn mini_config_load() -> MiniConfig {
         // Simple check: assume "chat" if length is 4. Full string compare needs PTR_U8.
         api_mode = 1;
     };
+    // SCODEX_MCP: command to start an MCP server over stdio.
+    // Overridden by --mcp <command> CLI arg (handled in main.sla).
+    let (mcp_ptr, mcp_len) = mini_config_env_or(STR_PTR("SCODEX_MCP"), STR_LEN("SCODEX_MCP"), PTR_NULL(), 0);
+    // SCODEX_BASE_URL: override the API base URL (for testing/proxies).
+    let (base_ptr, base_len) = mini_config_env_or(
+        STR_PTR("SCODEX_BASE_URL"), STR_LEN("SCODEX_BASE_URL"),
+        STR_PTR("https://api.openai.com/v1"), STR_LEN("https://api.openai.com/v1")
+    );
+    // SCODEX_MODEL: override the model name.
+    let (model_ptr, model_len) = mini_config_env_or(
+        STR_PTR("SCODEX_MODEL"), STR_LEN("SCODEX_MODEL"),
+        STR_PTR("gpt-5"), STR_LEN("gpt-5")
+    );
     let cfg = MiniConfig {
         api_key_ptr: key_ptr,
         api_key_len: key_len,
-        model_ptr: STR_PTR("gpt-5"),
-        model_len: STR_LEN("gpt-5"),
-        base_url_ptr: STR_PTR("https://api.openai.com/v1"),
-        base_url_len: STR_LEN("https://api.openai.com/v1"),
+        model_ptr: model_ptr,
+        model_len: model_len,
+        base_url_ptr: base_ptr,
+        base_url_len: base_len,
         max_turns: 8,
         api_mode: api_mode,
+        mcp_cmd_ptr: mcp_ptr,
+        mcp_cmd_len: mcp_len,
         ok: key_len != 0,
     };
     return cfg;
@@ -56,4 +73,25 @@ fn mini_config_load() -> MiniConfig {
     let cfg = mini_config_load();
     if cfg.model_len == 0 { panic(101); };
     if cfg.base_url_len == 0 { panic(102); };
+}
+
+// Override the MCP server command from a CLI arg. If the CLI arg is empty,
+// keep the env-derived value from mini_config_load().
+fn mini_config_apply_mcp(cfg: MiniConfig, mcp_ptr: ptr, mcp_len: u64) -> MiniConfig {
+    if mcp_len == 0 {
+        return cfg;
+    };
+    return MiniConfig {
+        api_key_ptr: cfg.api_key_ptr,
+        api_key_len: cfg.api_key_len,
+        model_ptr: cfg.model_ptr,
+        model_len: cfg.model_len,
+        base_url_ptr: cfg.base_url_ptr,
+        base_url_len: cfg.base_url_len,
+        max_turns: cfg.max_turns,
+        api_mode: cfg.api_mode,
+        mcp_cmd_ptr: mcp_ptr,
+        mcp_cmd_len: mcp_len,
+        ok: cfg.ok,
+    };
 }
