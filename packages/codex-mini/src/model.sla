@@ -11,6 +11,7 @@
 @import "protocol.sla"
 @import "http.sla"
 @import "tools.sla"
+@import "image.sla"
 @import "plugin_abi/db.sai"
 @import "sa_std/time.sai"
 @import "sessionx.sa"
@@ -32,6 +33,12 @@ struct MiniInputItem {
     name_len: u64,
     args_ptr: ptr,
     args_len: u64,
+    // Image payload for UserText items (base64, no data: prefix).
+    // img_len == 0 means no image.
+    img_ptr: ptr,
+    img_len: u64,
+    img_mime_ptr: ptr,
+    img_mime_len: u64,
 }
 
 fn mini_input_user(text_ptr: ptr, text_len: u64) -> MiniInputItem {
@@ -45,6 +52,29 @@ fn mini_input_user(text_ptr: ptr, text_len: u64) -> MiniInputItem {
         name_len: 0,
         args_ptr: PTR_NULL(),
         args_len: 0,
+        img_ptr: PTR_NULL(),
+        img_len: 0,
+        img_mime_ptr: PTR_NULL(),
+        img_mime_len: 0,
+    };
+}
+
+// User message with an attached image (base64 payload + MIME type).
+fn mini_input_user_image(text_ptr: ptr, text_len: u64, img_ptr: ptr, img_len: u64, mime_ptr: ptr, mime_len: u64) -> MiniInputItem {
+    return MiniInputItem {
+        kind: MiniInputKind::UserText,
+        text_ptr: text_ptr,
+        text_len: text_len,
+        call_id_ptr: PTR_NULL(),
+        call_id_len: 0,
+        name_ptr: PTR_NULL(),
+        name_len: 0,
+        args_ptr: PTR_NULL(),
+        args_len: 0,
+        img_ptr: img_ptr,
+        img_len: img_len,
+        img_mime_ptr: mime_ptr,
+        img_mime_len: mime_len,
     };
 }
 
@@ -59,6 +89,10 @@ fn mini_input_assistant(text_ptr: ptr, text_len: u64) -> MiniInputItem {
         name_len: 0,
         args_ptr: PTR_NULL(),
         args_len: 0,
+        img_ptr: PTR_NULL(),
+        img_len: 0,
+        img_mime_ptr: PTR_NULL(),
+        img_mime_len: 0,
     };
 }
 
@@ -73,6 +107,10 @@ fn mini_input_func_call(call_id_ptr: ptr, call_id_len: u64, name_ptr: ptr, name_
         name_len: name_len,
         args_ptr: args_ptr,
         args_len: args_len,
+        img_ptr: PTR_NULL(),
+        img_len: 0,
+        img_mime_ptr: PTR_NULL(),
+        img_mime_len: 0,
     };
 }
 
@@ -87,6 +125,10 @@ fn mini_input_func_output(call_id_ptr: ptr, call_id_len: u64, out_ptr: ptr, out_
         name_len: 0,
         args_ptr: PTR_NULL(),
         args_len: 0,
+        img_ptr: PTR_NULL(),
+        img_len: 0,
+        img_mime_ptr: PTR_NULL(),
+        img_mime_len: 0,
     };
 }
 
@@ -118,6 +160,13 @@ fn mini_model_build_request(cfg: MiniConfig, items: Vec<MiniInputItem>) -> ptr {
                 sa_json_writer_field_string(w, STR_PTR("type"), STR_LEN("type"), STR_PTR("input_text"), STR_LEN("input_text"));
                 sa_json_writer_field_string(w, STR_PTR("text"), STR_LEN("text"), item.text_ptr, item.text_len);
                 sa_json_writer_end_object(w);
+                if item.img_len > 0 {
+                    let (durl_ptr, durl_len) = mini_image_data_url(item.img_mime_ptr, item.img_mime_len, item.img_ptr, item.img_len);
+                    sa_json_writer_begin_object(w);
+                    sa_json_writer_field_string(w, STR_PTR("type"), STR_LEN("type"), STR_PTR("input_image"), STR_LEN("input_image"));
+                    sa_json_writer_field_string(w, STR_PTR("image_url"), STR_LEN("image_url"), durl_ptr, durl_len);
+                    sa_json_writer_end_object(w);
+                };
                 sa_json_writer_end_array(w);
             },
             MiniInputKind::AssistantText => {
@@ -187,7 +236,25 @@ fn mini_model_build_request_chat(cfg: MiniConfig, items: Vec<MiniInputItem>) -> 
         match item.kind {
             MiniInputKind::UserText => {
                 sa_json_writer_field_string(w, STR_PTR("role"), STR_LEN("role"), STR_PTR("user"), STR_LEN("user"));
-                sa_json_writer_field_string(w, STR_PTR("content"), STR_LEN("content"), item.text_ptr, item.text_len);
+                if item.img_len > 0 {
+                    sa_json_writer_object_field(w, STR_PTR("content"), STR_LEN("content"));
+                    sa_json_writer_begin_array(w);
+                    sa_json_writer_begin_object(w);
+                    sa_json_writer_field_string(w, STR_PTR("type"), STR_LEN("type"), STR_PTR("text"), STR_LEN("text"));
+                    sa_json_writer_field_string(w, STR_PTR("text"), STR_LEN("text"), item.text_ptr, item.text_len);
+                    sa_json_writer_end_object(w);
+                    let (durl_ptr2, durl_len2) = mini_image_data_url(item.img_mime_ptr, item.img_mime_len, item.img_ptr, item.img_len);
+                    sa_json_writer_begin_object(w);
+                    sa_json_writer_field_string(w, STR_PTR("type"), STR_LEN("type"), STR_PTR("image_url"), STR_LEN("image_url"));
+                    sa_json_writer_object_field(w, STR_PTR("image_url"), STR_LEN("image_url"));
+                    sa_json_writer_begin_object(w);
+                    sa_json_writer_field_string(w, STR_PTR("url"), STR_LEN("url"), durl_ptr2, durl_len2);
+                    sa_json_writer_end_object(w);
+                    sa_json_writer_end_object(w);
+                    sa_json_writer_end_array(w);
+                } else {
+                    sa_json_writer_field_string(w, STR_PTR("content"), STR_LEN("content"), item.text_ptr, item.text_len);
+                };
             },
             MiniInputKind::AssistantText => {
                 sa_json_writer_field_string(w, STR_PTR("role"), STR_LEN("role"), STR_PTR("assistant"), STR_LEN("assistant"));
@@ -1011,6 +1078,48 @@ fn session_resume_load(session_id: u64) -> (u64, u64, Vec<MiniInputItem>) {
         if role == 0 {
             items.push(mini_input_user(bbuf, blen));
         } else {
+            if role == 4 {
+                // User image message: {"text","img","mime"} JSON blob.
+                let broot4 = JSON_PARSE(bbuf, blen);
+                let ok4 = false;
+                let tk = STR_PTR("text");
+                let tkl = STR_LEN("text");
+                let ik = STR_PTR("img");
+                let ikl = STR_LEN("img");
+                let mk = STR_PTR("mime");
+                let mkl = STR_LEN("mime");
+                if broot4 != PTR_NULL() {
+                    if X_OBJ_HAS(broot4, tk, tkl) == true {
+                        if X_OBJ_HAS(broot4, ik, ikl) == true {
+                            if X_OBJ_HAS(broot4, mk, mkl) == true {
+                                let txp = X_OBJ_STR_PTR(broot4, tk, tkl);
+                                let txl = X_OBJ_STR_LEN(broot4, tk, tkl);
+                                let imp = X_OBJ_STR_PTR(broot4, ik, ikl);
+                                let iml = X_OBJ_STR_LEN(broot4, ik, ikl);
+                                let mip = X_OBJ_STR_PTR(broot4, mk, mkl);
+                                let mil = X_OBJ_STR_LEN(broot4, mk, mkl);
+                                if txp != PTR_NULL() {
+                                    if imp != PTR_NULL() {
+                                        if mip != PTR_NULL() {
+                                            if iml > 0 {
+                                                if mil > 0 {
+                                                    items.push(mini_input_user_image(txp, txl, imp, iml, mip, mil));
+                                                    ok4 = true;
+                                                };
+                                            };
+                                        };
+                                    };
+                                };
+                            };
+                        };
+                    };
+                };
+                if ok4 != true {
+                    println("scodex-mini: corrupt image message record (session {} seq {})", session_id, seq);
+                    sa_db_close_read_table(mh);
+                    return (1, 0, empty);
+                };
+            } else {
             if role == 1 {
                 items.push(mini_input_assistant(bbuf, blen));
             } else {
@@ -1081,6 +1190,7 @@ fn session_resume_load(session_id: u64) -> (u64, u64, Vec<MiniInputItem>) {
                         return (1, 0, empty);
                     };
                 };
+            };
             };
         };
         i = i + 1;

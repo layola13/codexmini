@@ -9,6 +9,7 @@
 @import "sa_std/io/print.sai"
 @import "config.sla"
 @import "model.sla"
+@import "image.sla"
 
 
 // mini_cli_arg(idx): argv[idx] as (ptr, len, ok). ok=false when missing,
@@ -164,6 +165,90 @@ fn mini_cli_join_range(from: u64) -> (ptr, u64, bool) {
     return (buf, total - 1, true);
 }
 
+// mini_cli_run_image(path_idx): scodex-mini --image <path> <prompt...>
+// Loads the image as base64 and sends it as multimodal input.
+fn mini_cli_run_image(path_idx: u64) -> i32 {
+    let (ppp, ppl, ppok) = mini_cli_arg(path_idx);
+    if ppok != true {
+        println("usage: scodex-mini --image <path> <prompt>");
+        return 2;
+    };
+    let (prp, prl, prok) = mini_cli_join_range(path_idx + 1);
+    if prok != true {
+        println("usage: scodex-mini --image <path> <prompt>");
+        return 2;
+    };
+    let cfg = mini_config_load();
+    if cfg.ok != true {
+        println("scodex-mini: missing OPENAI_API_KEY");
+        return 2;
+    };
+    let (b64p, b64l, bufh, mptr, mlen, iok) = mini_image_load(ppp, ppl);
+    if iok != true {
+        return 1;
+    };
+    if session_db_ensure() != true {
+        return 1;
+    };
+    let sid = session_create(prp, prl);
+    if sid == 0 {
+        return 1;
+    };
+    // Persist as role 4 (user image message): {"text","img","mime"} JSON blob.
+    let (blobp, bloblen) = mini_image_session_blob(prp, prl, b64p, b64l, mptr, mlen);
+    if session_add_message(sid, 0, 4, blobp, bloblen) != true {
+        println("scodex-mini: session save failed");
+        return 1;
+    };
+    let items: Vec<MiniInputItem> = Vec::new();
+    items.push(mini_input_user_image(prp, prl, b64p, b64l, mptr, mlen));
+    // NOTE: bufh (image base64 buffer) stays alive for the whole run;
+    // freed on process exit.
+    let code = mini_model_run_conversation(cfg, sid, 1, items);
+    return code;
+}
+
+// mini_cli_run_file(path_idx): scodex-mini --file <path> <prompt...>
+// Injects the text file's contents into the prompt as context.
+fn mini_cli_run_file(path_idx: u64) -> i32 {
+    let (ppp, ppl, ppok) = mini_cli_arg(path_idx);
+    if ppok != true {
+        println("usage: scodex-mini --file <path> <prompt>");
+        return 2;
+    };
+    let (prp, prl, prok) = mini_cli_join_range(path_idx + 1);
+    if prok != true {
+        println("usage: scodex-mini --file <path> <prompt>");
+        return 2;
+    };
+    let cfg = mini_config_load();
+    if cfg.ok != true {
+        println("scodex-mini: missing OPENAI_API_KEY");
+        return 2;
+    };
+    let (ftp, ftl, fbufh, fok) = mini_file_load_text(ppp, ppl);
+    if fok != true {
+        return 1;
+    };
+    let (cptr, clen) = mini_file_combine_prompt(ppp, ppl, ftp, ftl, prp, prl);
+    if session_db_ensure() != true {
+        return 1;
+    };
+    let sid = session_create(cptr, clen);
+    if sid == 0 {
+        return 1;
+    };
+    if session_add_message(sid, 0, 0, cptr, clen) != true {
+        println("scodex-mini: session save failed");
+        return 1;
+    };
+    let items: Vec<MiniInputItem> = Vec::new();
+    items.push(mini_input_user(cptr, clen));
+    // NOTE: fbufh (file text buffer) stays alive for the whole run.
+    let code = mini_model_run_conversation(cfg, sid, 1, items);
+    return code;
+}
+
 fn main() -> i32 {
     let (a1p, a1l, a1ok) = mini_cli_arg(1);
     if a1ok == true {
@@ -209,6 +294,18 @@ fn main() -> i32 {
             };
             items.push(mini_input_user(prp, prl));
             return mini_model_run_conversation(cfg, sid, next_seq + 1, items);
+        };
+        if mini_model_str_eq(a1p, a1l, STR_PTR("--image"), STR_LEN("--image")) == true {
+            return mini_cli_run_image(2);
+        };
+        if mini_model_str_eq(a1p, a1l, STR_PTR("-i"), STR_LEN("-i")) == true {
+            return mini_cli_run_image(2);
+        };
+        if mini_model_str_eq(a1p, a1l, STR_PTR("--file"), STR_LEN("--file")) == true {
+            return mini_cli_run_file(2);
+        };
+        if mini_model_str_eq(a1p, a1l, STR_PTR("-f"), STR_LEN("-f")) == true {
+            return mini_cli_run_file(2);
         };
     };
     let cfg = mini_config_load();

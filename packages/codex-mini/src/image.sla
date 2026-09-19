@@ -1,0 +1,166 @@
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "slicex.sa"
+@import "sa_std/core/slice.sa"
+@import "sa_std/encoding/json.sai"
+@import "sa_std/encoding/json.sa"
+@import "jsonx.sa"
+@import "sa_std/io/print.sai"
+
+fn mini_str_ends_with(hptr: ptr, hlen: u64, sptr: ptr, slen: u64) -> bool {
+    if slen == 0 {
+        return true;
+    };
+    if slen > hlen {
+        return false;
+    };
+    let off = hlen - slen;
+    let hp = X_PTR_ADD(hptr, off);
+    return X_STR_EQ(hp, slen, sptr, slen);
+}
+
+// Detect image MIME type from the file extension.
+// Returns (mime_ptr, mime_len, ok). ok=false for unsupported extensions.
+fn mini_image_mime_from_path(pptr: ptr, plen: u64) -> (ptr, u64, bool) {
+    if mini_str_ends_with(pptr, plen, STR_PTR(".png"), STR_LEN(".png")) == true {
+        return (STR_PTR("image/png"), STR_LEN("image/png"), true);
+    };
+    if mini_str_ends_with(pptr, plen, STR_PTR(".PNG"), STR_LEN(".PNG")) == true {
+        return (STR_PTR("image/png"), STR_LEN("image/png"), true);
+    };
+    if mini_str_ends_with(pptr, plen, STR_PTR(".jpg"), STR_LEN(".jpg")) == true {
+        return (STR_PTR("image/jpeg"), STR_LEN("image/jpeg"), true);
+    };
+    if mini_str_ends_with(pptr, plen, STR_PTR(".JPG"), STR_LEN(".JPG")) == true {
+        return (STR_PTR("image/jpeg"), STR_LEN("image/jpeg"), true);
+    };
+    if mini_str_ends_with(pptr, plen, STR_PTR(".jpeg"), STR_LEN(".jpeg")) == true {
+        return (STR_PTR("image/jpeg"), STR_LEN("image/jpeg"), true);
+    };
+    if mini_str_ends_with(pptr, plen, STR_PTR(".JPEG"), STR_LEN(".JPEG")) == true {
+        return (STR_PTR("image/jpeg"), STR_LEN("image/jpeg"), true);
+    };
+    if mini_str_ends_with(pptr, plen, STR_PTR(".gif"), STR_LEN(".gif")) == true {
+        return (STR_PTR("image/gif"), STR_LEN("image/gif"), true);
+    };
+    if mini_str_ends_with(pptr, plen, STR_PTR(".GIF"), STR_LEN(".GIF")) == true {
+        return (STR_PTR("image/gif"), STR_LEN("image/gif"), true);
+    };
+    if mini_str_ends_with(pptr, plen, STR_PTR(".webp"), STR_LEN(".webp")) == true {
+        return (STR_PTR("image/webp"), STR_LEN("image/webp"), true);
+    };
+    if mini_str_ends_with(pptr, plen, STR_PTR(".WEBP"), STR_LEN(".WEBP")) == true {
+        return (STR_PTR("image/webp"), STR_LEN("image/webp"), true);
+    };
+    return (PTR_NULL(), 0, false);
+}
+
+// Build "data:<mime>;base64,<b64>" into a heap string.
+// Returns (ptr, len).
+fn mini_image_data_url(mptr: ptr, mlen: u64, bptr: ptr, blen: u64) -> (ptr, u64) {
+    let p1 = STR_PTR("data:");
+    let l1 = STR_LEN("data:");
+    let p2 = STR_PTR(";base64,");
+    let l2 = STR_LEN(";base64,");
+    let total = l1 + mlen + l2 + blen;
+    let out = X_HEAP_BUF_PTR(total);
+    var off: u64;
+    off = 0;
+    X_COPY_BYTES(X_PTR_ADD(out, off), p1, l1);
+    off = off + l1;
+    X_COPY_BYTES(X_PTR_ADD(out, off), mptr, mlen);
+    off = off + mlen;
+    X_COPY_BYTES(X_PTR_ADD(out, off), p2, l2);
+    off = off + l2;
+    X_COPY_BYTES(X_PTR_ADD(out, off), bptr, blen);
+    return (out, total);
+}
+
+// Load an image file as base64.
+// Returns (b64_ptr, b64_len, buf_handle, mime_ptr, mime_len, ok).
+fn mini_image_load(pptr: ptr, plen: u64) -> (ptr, u64, u64, ptr, u64, bool) {
+    let (mptr, mlen, mok) = mini_image_mime_from_path(pptr, plen);
+    if mok != true {
+        println("scodex-mini: unsupported image type (use .png .jpg .jpeg .gif .webp)");
+        return (PTR_NULL(), 0, 0, PTR_NULL(), 0, false);
+    };
+    let buf: u64 = 0;
+    let st: i32 = sa_std_fs_read_file_base64(pptr, plen, 10485760, &buf);
+    if st != 0 {
+        println("scodex-mini: cannot read image file");
+        return (PTR_NULL(), 0, 0, PTR_NULL(), 0, false);
+    };
+    let dlen: u64 = sa_fs_read_buffer_len(buf);
+    if dlen == 0 {
+        println("scodex-mini: image file is empty");
+        return (PTR_NULL(), 0, 0, PTR_NULL(), 0, false);
+    };
+    let dptr_ref = sa_fs_read_buffer_data(buf);
+    let dptr: ptr = dptr_ref;
+    return (dptr, dlen, buf, mptr, mlen, true);
+}
+
+// Build the session blob for an image message (role 4):
+// {"text":"...","img":"<base64>","mime":"..."}.
+// Returns (ptr, len).
+fn mini_image_session_blob(tptr: ptr, tlen: u64, bptr: ptr, blen: u64, mptr: ptr, mlen: u64) -> (ptr, u64) {
+    let w: ptr = PTR_NULL();
+    sa_json_writer_new(0, 1, 0, 0, 0, &w);
+    sa_json_writer_begin_object(w);
+    sa_json_writer_field_string(w, STR_PTR("text"), STR_LEN("text"), tptr, tlen);
+    sa_json_writer_field_string(w, STR_PTR("img"), STR_LEN("img"), bptr, blen);
+    sa_json_writer_field_string(w, STR_PTR("mime"), STR_LEN("mime"), mptr, mlen);
+    sa_json_writer_end_object(w);
+    let buf = sa_json_writer_finish_buffer(w);
+    sa_json_writer_free(w);
+    let bl = sa_json_buffer_len(buf);
+    let bp_ref = sa_json_buffer_data(buf);
+    let bp: ptr = bp_ref;
+    return (bp, bl);
+}
+
+// Max text file size for --file: 1 MiB.
+fn mini_file_max_bytes() -> u64 {
+    return 1048576;
+}
+
+// Load a text file for --file. Returns (text_ptr, text_len, buf_handle, ok).
+fn mini_file_load_text(pptr: ptr, plen: u64) -> (ptr, u64, u64, bool) {
+    let buf: u64 = 0;
+    let st: i32 = sa_std_fs_read_to_string(pptr, plen, mini_file_max_bytes(), &buf);
+    if st != 0 {
+        return (PTR_NULL(), 0, 0, false);
+    };
+    let dlen: u64 = sa_fs_read_buffer_len(buf);
+    let dptr_ref = sa_fs_read_buffer_data(buf);
+    let dptr: ptr = dptr_ref;
+    return (dptr, dlen, buf, true);
+}
+
+// Build the combined prompt for --file:
+// "[file: <path>]\n<contents>\n[/file]\n\n<prompt>"
+// Returns (ptr, len).
+fn mini_file_combine_prompt(pptr: ptr, plen: u64, fptr: ptr, flen: u64, tptr: ptr, tlen: u64) -> (ptr, u64) {
+    let h1p = STR_PTR("[file: ");
+    let h1l = STR_LEN("[file: ");
+    let h2p = STR_PTR("]\n");
+    let h2l = STR_LEN("]\n");
+    let h3p = STR_PTR("\n[/file]\n\n");
+    let h3l = STR_LEN("\n[/file]\n\n");
+    let total = h1l + plen + h2l + flen + h3l + tlen;
+    let out = X_HEAP_BUF_PTR(total);
+    var off: u64;
+    off = 0;
+    X_COPY_BYTES(X_PTR_ADD(out, off), h1p, h1l);
+    off = off + h1l;
+    X_COPY_BYTES(X_PTR_ADD(out, off), pptr, plen);
+    off = off + plen;
+    X_COPY_BYTES(X_PTR_ADD(out, off), h2p, h2l);
+    off = off + h2l;
+    X_COPY_BYTES(X_PTR_ADD(out, off), fptr, flen);
+    off = off + flen;
+    X_COPY_BYTES(X_PTR_ADD(out, off), h3p, h3l);
+    off = off + h3l;
+    X_COPY_BYTES(X_PTR_ADD(out, off), tptr, tlen);
+    return (out, total);
+}
