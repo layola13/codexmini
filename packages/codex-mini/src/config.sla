@@ -1,6 +1,15 @@
 @import "sa_std/env.sa"
 @import "sa_std/string.sa"
 @import "sa_std/ptr.sa"
+@import "sa_std/vec.sa"
+@import "slicex.sa"
+@import "sa_std/core/slice.sa"
+@import "sa_std/io/print.sai"
+@import "sa_std/encoding/json.sai"
+@import "sa_std/encoding/json.sa"
+@import "jsonx.sa"
+@import "sa_std/fs.sa"
+@import "mcp.sla"
 
 struct MiniConfig {
     api_key_ptr: ptr,
@@ -11,8 +20,7 @@ struct MiniConfig {
     base_url_len: u64,
     max_turns: u64,
     api_mode: u64,
-    mcp_cmd_ptr: ptr,
-    mcp_cmd_len: u64,
+    mcp_servers: Vec<MiniMcpServer>,
     ok: bool,
 }
 
@@ -29,6 +37,140 @@ fn mini_config_env_or(key_lit_ptr: ptr, key_lit_len: u64, fallback_ptr: ptr, fal
     return (ENV_BUFFER_DATA(buf), len);
 }
 
+// mini_config_servers_from_json: parse {"name": {"command","args","env"}}
+// into the registry. Returns the number of servers added. Malformed entries
+// are skipped with an explicit warning (never silently misconfigured).
+fn mini_config_servers_from_json(
+    servers: Vec<MiniMcpServer>,
+    obj_node: ptr,
+) -> u64 {
+    var added: u64;
+    added = 0;
+    var ki: u64;
+    ki = 0;
+    var done: u64;
+    done = 0;
+    while done == 0 {
+        let kptr: ptr = PTR_NULL();
+        let klen: u64 = 0;
+        let kst = sa_json_object_key_at(obj_node, ki, &kptr, &klen);
+        if kst != 0 {
+            done = 1;
+        } else {
+            let srv_node: ptr = PTR_NULL();
+            let gst = sa_json_object_get(obj_node, kptr, klen, &srv_node);
+            if gst != 0 {
+                println("scodex-mini: mcp config: cannot read server entry, skipped");
+            } else {
+                let is_obj: bool = false;
+                JSON_IS_OBJECT(is_obj, srv_node);
+                if is_obj != true {
+                    println("scodex-mini: mcp config: server entry must be an object, skipped");
+                } else {
+                    let (cmd_ptr, cmd_len, cmd_ok) = mini_mcp_build_server_cmd(srv_node);
+                    if cmd_ok == true {
+                        // copy the name: it points into the config JSON buffer
+                        let nbuf = X_HEAP_BUF_PTR(klen);
+                        X_COPY_BYTES(nbuf, kptr, klen);
+                        let srv = mini_mcp_server_new(nbuf, klen, cmd_ptr, cmd_len);
+                        servers.push(srv);
+                        added = added + 1;
+                    };
+                    // (a warning was already printed by the builder on failure)
+                };
+            };
+            ki = ki + 1;
+        };
+    }
+    return added;
+}
+
+// mini_config_load_mcp_servers: build the MCP server registry.
+// Sources, in order:
+//   1. SCODEX_MCP_SERVERS env (JSON object, same shape as the config file)
+//   2. <config file> "mcp_servers" object
+//   3. SCODEX_MCP env (single legacy server, registered as "default")
+fn mini_config_load_mcp_servers() -> Vec<MiniMcpServer> {
+    let servers: Vec<MiniMcpServer> = Vec::new();
+
+    // 1. SCODEX_MCP_SERVERS env
+    let (se_ptr, se_len) = mini_config_env_or(
+        STR_PTR("SCODEX_MCP_SERVERS"), STR_LEN("SCODEX_MCP_SERVERS"), PTR_NULL(), 0);
+    if se_len > 0 {
+        let se_root = JSON_PARSE(se_ptr, se_len);
+        let se_is_obj: bool = false;
+        JSON_IS_OBJECT(se_is_obj, se_root);
+        if se_is_obj == true {
+            mini_config_servers_from_json(servers, se_root);
+        };
+        if se_is_obj != true {
+            println("scodex-mini: SCODEX_MCP_SERVERS must be a JSON object, ignored");
+        };
+    };
+
+    // 2. config file "mcp_servers"
+    let (cfg_path_ptr, cfg_path_len) = mini_config_path();
+    if cfg_path_len > 0 {
+        let fbuf: u64 = 0;
+        let fst = sa_std_fs_read_to_string(cfg_path_ptr, cfg_path_len, 1048576, &fbuf);
+        if fst == 0 {
+            let flen = sa_fs_read_buffer_len(fbuf);
+            if flen > 0 {
+                let fref = sa_fs_read_buffer_data(fbuf);
+                let fptr: ptr = fref;
+                let froot = JSON_PARSE(fptr, flen);
+                let has_ms: bool = false;
+                X_OBJ_HAS(has_ms, froot, STR_PTR("mcp_servers"), STR_LEN("mcp_servers"));
+                if has_ms == true {
+                    let ms_node: ptr = PTR_NULL();
+                    let mst = sa_json_object_get(froot,
+                        STR_PTR("mcp_servers"), STR_LEN("mcp_servers"), &ms_node);
+                    if mst == 0 {
+                        let ms_is_obj: bool = false;
+                        JSON_IS_OBJECT(ms_is_obj, ms_node);
+                        if ms_is_obj == true {
+                            mini_config_servers_from_json(servers, ms_node);
+                        };
+                        if ms_is_obj != true {
+                            println("scodex-mini: config: \"mcp_servers\" must be an object, ignored");
+                        };
+                    };
+                };
+            };
+        };
+    };
+
+    // 3. legacy single-server SCODEX_MCP env
+    let (mcp_ptr, mcp_len) = mini_config_env_or(STR_PTR("SCODEX_MCP"), STR_LEN("SCODEX_MCP"), PTR_NULL(), 0);
+    if mcp_len > 0 {
+        let nbuf = X_HEAP_BUF_PTR(STR_LEN("default"));
+        X_COPY_BYTES(nbuf, STR_PTR("default"), STR_LEN("default"));
+        let cbuf = X_HEAP_BUF_PTR(mcp_len);
+        X_COPY_BYTES(cbuf, mcp_ptr, mcp_len);
+        let srv = mini_mcp_server_new(nbuf, STR_LEN("default"), cbuf, mcp_len);
+        servers.push(srv);
+    };
+
+    return servers;
+}
+
+// mini_config_path: SCODEX_CONFIG env, else $HOME/.scodex-mini/config.json.
+fn mini_config_path() -> (ptr, u64) {
+    let (ep, el) = mini_config_env_or(STR_PTR("SCODEX_CONFIG"), STR_LEN("SCODEX_CONFIG"), PTR_NULL(), 0);
+    if el > 0 {
+        return (ep, el);
+    };
+    let (hp, hl) = mini_config_env_or(STR_PTR("HOME"), STR_LEN("HOME"), PTR_NULL(), 0);
+    if hl == 0 {
+        return (PTR_NULL(), 0);
+    };
+    let total = hl + STR_LEN("/.scodex-mini/config.json");
+    let buf = X_HEAP_BUF_PTR(total);
+    X_COPY_BYTES(buf, hp, hl);
+    X_COPY_BYTES(X_PTR_ADD(buf, hl), STR_PTR("/.scodex-mini/config.json"), STR_LEN("/.scodex-mini/config.json"));
+    return (buf, total);
+}
+
 fn mini_config_load() -> MiniConfig {
     let (key_ptr, key_len) = mini_config_env_or(STR_PTR("OPENAI_API_KEY"), STR_LEN("OPENAI_API_KEY"), PTR_NULL(), 0);
     // SCODEX_API_MODE: "chat" for Chat Completions API, otherwise Responses API.
@@ -40,9 +182,7 @@ fn mini_config_load() -> MiniConfig {
         // Simple check: assume "chat" if length is 4. Full string compare needs PTR_U8.
         api_mode = 1;
     };
-    // SCODEX_MCP: command to start an MCP server over stdio.
-    // Overridden by --mcp <command> CLI arg (handled in main.sla).
-    let (mcp_ptr, mcp_len) = mini_config_env_or(STR_PTR("SCODEX_MCP"), STR_LEN("SCODEX_MCP"), PTR_NULL(), 0);
+    let servers = mini_config_load_mcp_servers();
     // SCODEX_BASE_URL: override the API base URL (for testing/proxies).
     let (base_ptr, base_len) = mini_config_env_or(
         STR_PTR("SCODEX_BASE_URL"), STR_LEN("SCODEX_BASE_URL"),
@@ -62,8 +202,7 @@ fn mini_config_load() -> MiniConfig {
         base_url_len: base_len,
         max_turns: 8,
         api_mode: api_mode,
-        mcp_cmd_ptr: mcp_ptr,
-        mcp_cmd_len: mcp_len,
+        mcp_servers: servers,
         ok: key_len != 0,
     };
     return cfg;
@@ -75,12 +214,19 @@ fn mini_config_load() -> MiniConfig {
     if cfg.base_url_len == 0 { panic(102); };
 }
 
-// Override the MCP server command from a CLI arg. If the CLI arg is empty,
-// keep the env-derived value from mini_config_load().
+// Override the MCP server list from a --mcp <command> CLI arg: registers a
+// single legacy server named "default". Empty arg keeps config/env values.
 fn mini_config_apply_mcp(cfg: MiniConfig, mcp_ptr: ptr, mcp_len: u64) -> MiniConfig {
     if mcp_len == 0 {
         return cfg;
     };
+    let servers: Vec<MiniMcpServer> = Vec::new();
+    let nbuf = X_HEAP_BUF_PTR(STR_LEN("default"));
+    X_COPY_BYTES(nbuf, STR_PTR("default"), STR_LEN("default"));
+    let cbuf = X_HEAP_BUF_PTR(mcp_len);
+    X_COPY_BYTES(cbuf, mcp_ptr, mcp_len);
+    let srv = mini_mcp_server_new(nbuf, STR_LEN("default"), cbuf, mcp_len);
+    servers.push(srv);
     return MiniConfig {
         api_key_ptr: cfg.api_key_ptr,
         api_key_len: cfg.api_key_len,
@@ -90,8 +236,7 @@ fn mini_config_apply_mcp(cfg: MiniConfig, mcp_ptr: ptr, mcp_len: u64) -> MiniCon
         base_url_len: cfg.base_url_len,
         max_turns: cfg.max_turns,
         api_mode: cfg.api_mode,
-        mcp_cmd_ptr: mcp_ptr,
-        mcp_cmd_len: mcp_len,
+        mcp_servers: servers,
         ok: cfg.ok,
     };
 }

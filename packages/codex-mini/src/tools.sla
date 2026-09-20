@@ -4,6 +4,7 @@
 @import "sa_std/ptr.sa"
 @import "slicex.sa"
 @import "sa_std/core/slice.sa"
+@import "sessionx.sa"
 
 struct MiniExecResult {
     code: i32,
@@ -59,4 +60,39 @@ fn mini_exec_result_free(result: MiniExecResult) -> bool {
     let r = mini_exec_result_failed();
     if r.ok != false { panic(401); };
     if r.out_len != 0 { panic(402); };
+}
+
+// mini_parse_u64: parses an all-digit ASCII string. Non-digit -> (0, false).
+// NOTE: written without a u8->u64 `as` cast — that cast shape triggers
+// error.CodegenError in the SAB lowering path (2026-09-18).
+fn mini_parse_u64(p: ptr, len: u64) -> (u64, bool) {
+    if len == 0 {
+        return (0, false);
+    };
+    var v: u64;
+    v = 0;
+    let i: u64 = 0;
+    while i < len {
+        let bp = X_PTR_ADD(p, i);
+        let b = X_LOAD_U8(bp);
+        if b < 48 {
+            return (0, false);
+        };
+        if b > 57 {
+            return (0, false);
+        };
+        v = v * 10;
+        if b == 48 { v = v + 0; };
+        if b == 49 { v = v + 1; };
+        if b == 50 { v = v + 2; };
+        if b == 51 { v = v + 3; };
+        if b == 52 { v = v + 4; };
+        if b == 53 { v = v + 5; };
+        if b == 54 { v = v + 6; };
+        if b == 55 { v = v + 7; };
+        if b == 56 { v = v + 8; };
+        if b == 57 { v = v + 9; };
+        i = i + 1;
+    }
+    return (v, true);
 }

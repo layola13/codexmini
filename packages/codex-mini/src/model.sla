@@ -144,9 +144,10 @@ fn mini_model_str_eq(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> bool {
 // Responses API format: {"type":"function","name":...,"description":...,"parameters":<inputSchema>}
 // Chat API format: {"type":"function","function":{"name":...,"description":...,"parameters":<inputSchema>}}
 // chat_mode=1 for Chat API, 0 for Responses API.
+// pfx/pfx_len: name prefix ("" for a single server, "<server>__" for many).
 // Returns true on success, false if the JSON is unusable (caller continues
 // without MCP tools).
-fn mini_model_write_mcp_tools(w: ptr, mcp_ptr: ptr, mcp_len: u64, chat_mode: u64) -> bool {
+fn mini_model_write_mcp_tools(w: ptr, mcp_ptr: ptr, mcp_len: u64, chat_mode: u64, pfx_ptr: ptr, pfx_len: u64) -> bool {
     let root = JSON_PARSE(mcp_ptr, mcp_len);
     if root == PTR_NULL() {
         return false;
@@ -181,7 +182,15 @@ fn mini_model_write_mcp_tools(w: ptr, mcp_ptr: ptr, mcp_len: u64, chat_mode: u64
                         let nref = sa_json_string_ptr(nslot2);
                         let nptr: ptr = nref;
                         let nlen = sa_json_string_len(nslot2);
-                        sa_json_writer_field_string(w, STR_PTR("name"), STR_LEN("name"), nptr, nlen);
+                        if pfx_len > 0 {
+                            let ntotal = pfx_len + nlen;
+                            let nbuf = X_HEAP_BUF_PTR(ntotal);
+                            X_COPY_BYTES(nbuf, pfx_ptr, pfx_len);
+                            X_COPY_BYTES(X_PTR_ADD(nbuf, pfx_len), nptr, nlen);
+                            sa_json_writer_field_string(w, STR_PTR("name"), STR_LEN("name"), nbuf, ntotal);
+                        } else {
+                            sa_json_writer_field_string(w, STR_PTR("name"), STR_LEN("name"), nptr, nlen);
+                        };
                         let dslot: ptr = PTR_NULL();
                         if sa_json_object_get(islot, STR_PTR("description"), STR_LEN("description"), &dslot) == 0 {
                             if dslot != PTR_NULL() {
@@ -264,8 +273,8 @@ fn mini_model_build_request(
     items: Vec<MiniInputItem>,
     skills_ptr: ptr,
     skills_len: u64,
-    mcp_ptr: ptr,
-    mcp_len: u64
+    mcp_sets: Vec<MiniMcpToolSet>,
+    mcp_multi: u64
 ) -> ptr {
     let w: ptr = PTR_NULL();
     sa_json_writer_new(0, 1, 0, 0, 0, &w);
@@ -344,8 +353,14 @@ fn mini_model_build_request(
     sa_json_writer_end_object(w);
     sa_json_writer_end_object(w);
     mini_model_write_apply_patch_tool(w, 0);
-    if mcp_len > 0 {
-        mini_model_write_mcp_tools(w, mcp_ptr, mcp_len, 0);
+    if mcp_sets.len() > 0 {
+        var msi: u64;
+        msi = 0;
+        while msi < mcp_sets.len() {
+            let mset = mcp_sets[msi];
+            mini_model_write_mcp_tools(w, mset.tools_ptr, mset.tools_len, 0, mset.pfx_ptr, mset.pfx_len);
+            msi = msi + 1;
+        }
     };
     sa_json_writer_end_array(w);
     sa_json_writer_end_object(w);
@@ -361,8 +376,8 @@ fn mini_model_build_request_chat(
     items: Vec<MiniInputItem>,
     skills_ptr: ptr,
     skills_len: u64,
-    mcp_ptr: ptr,
-    mcp_len: u64
+    mcp_sets: Vec<MiniMcpToolSet>,
+    mcp_multi: u64
 ) -> ptr {
     let w: ptr = PTR_NULL();
     sa_json_writer_new(0, 1, 0, 0, 0, &w);
@@ -463,8 +478,14 @@ fn mini_model_build_request_chat(
     sa_json_writer_end_object(w);
     sa_json_writer_end_object(w);
     mini_model_write_apply_patch_tool(w, 1);
-    if mcp_len > 0 {
-        mini_model_write_mcp_tools(w, mcp_ptr, mcp_len, 1);
+    if mcp_sets.len() > 0 {
+        var msi: u64;
+        msi = 0;
+        while msi < mcp_sets.len() {
+            let mset = mcp_sets[msi];
+            mini_model_write_mcp_tools(w, mset.tools_ptr, mset.tools_len, 1, mset.pfx_ptr, mset.pfx_len);
+            msi = msi + 1;
+        }
     };
     sa_json_writer_end_array(w);
     sa_json_writer_end_object(w);
@@ -479,13 +500,13 @@ fn mini_model_build_request_dispatch(
     items: Vec<MiniInputItem>,
     skills_ptr: ptr,
     skills_len: u64,
-    mcp_ptr: ptr,
-    mcp_len: u64
+    mcp_sets: Vec<MiniMcpToolSet>,
+    mcp_multi: u64
 ) -> ptr {
     if cfg.api_mode == 1 {
-        return mini_model_build_request_chat(cfg, items, skills_ptr, skills_len, mcp_ptr, mcp_len);
+        return mini_model_build_request_chat(cfg, items, skills_ptr, skills_len, mcp_sets, mcp_multi);
     };
-    return mini_model_build_request(cfg, items, skills_ptr, skills_len, mcp_ptr, mcp_len);
+    return mini_model_build_request(cfg, items, skills_ptr, skills_len, mcp_sets, mcp_multi);
 }
 
 fn mini_model_build_url(cfg: MiniConfig) -> (ptr, u64) {
@@ -854,6 +875,7 @@ fn mini_apply_patch_sla_check(p: ptr, n: u64) -> (bool, ptr, u64) {
     };
     return (false, exec.out_ptr, exec.out_len);
 }
+
 // Single-turn agent loop: prompt -> model -> (tool calls -> exec -> model)* -> done.
 // Mirrors the Rust codex-min single-turn behavior.
 fn mini_model_run_conversation(
@@ -877,23 +899,49 @@ fn mini_model_run_conversation(
         eff_skills_ptr = skills_ptr;
         eff_skills_len = skills_len;
     };
-    // List MCP tools once per run when --mcp / SCODEX_MCP is set.
-    var mcp_tools_ptr: ptr;
-    var mcp_tools_len: u64;
-    mcp_tools_ptr = PTR_NULL();
-    mcp_tools_len = 0;
-    if cfg.mcp_cmd_len > 0 {
-        let (mp, ml, mok) = mini_mcp_list_tools(cfg.mcp_cmd_ptr, cfg.mcp_cmd_len);
-        if mok == true {
-            mcp_tools_ptr = mp;
-            mcp_tools_len = ml;
-        } else {
-            println("scodex-mini: warning: mcp tool list failed, continuing without mcp tools");
-        };
+    // List MCP tools once per run when servers are configured.
+    // Any list failure is explicit: the run aborts, never silently
+    // continues without the tools the model was promised.
+    let mcp_sets: Vec<MiniMcpToolSet> = Vec::new();
+    let mcp_n = cfg.mcp_servers.len();
+    var mcp_multi: u64;
+    mcp_multi = 0;
+    if mcp_n > 1 {
+        mcp_multi = 1;
     };
+    var msi2: u64;
+    msi2 = 0;
+    while msi2 < mcp_n {
+        let srv = cfg.mcp_servers[msi2];
+        let (mp, ml, merr) = mini_mcp_list_tools(srv);
+        if merr != 0 {
+            let (etp, etl) = mini_mcp_err_text(merr);
+            println("scodex-mini: mcp tool list failed, aborting run");
+            sa_print_bytes(etp, etl);
+            sa_print_bytes(STR_PTR("\n"), 1);
+            return (1, p);
+        };
+        var pfx_ptr: ptr;
+        pfx_ptr = PTR_NULL();
+        var pfx_len: u64;
+        pfx_len = 0;
+        if mcp_multi == 1 {
+            // "<server>__"
+            let ptotal = srv.name_len + 2;
+            let pbuf = X_HEAP_BUF_PTR(ptotal);
+            X_COPY_BYTES(pbuf, srv.name_ptr, srv.name_len);
+            X_STORE_U8(X_PTR_ADD(pbuf, srv.name_len), 95);
+            X_STORE_U8(X_PTR_ADD(pbuf, srv.name_len + 1), 95);
+            pfx_ptr = pbuf;
+            pfx_len = ptotal;
+        };
+        let mset = mini_mcp_toolset_new(mp, ml, pfx_ptr, pfx_len);
+        mcp_sets.push(mset);
+        msi2 = msi2 + 1;
+    }
     let turn: u64 = 0;
     while turn < cfg.max_turns {
-        let json_buf = mini_model_build_request_dispatch(cfg, items, eff_skills_ptr, eff_skills_len, mcp_tools_ptr, mcp_tools_len);
+        let json_buf = mini_model_build_request_dispatch(cfg, items, eff_skills_ptr, eff_skills_len, mcp_sets, mcp_multi);
         if json_buf == PTR_NULL() {
             println("scodex-mini: failed to build request");
             return (1, p);
@@ -987,20 +1035,32 @@ fn mini_model_run_conversation(
                             out_ptr = STR_PTR("(bad arguments)");
                             out_len = STR_LEN("(bad arguments)");
                         };
-                    } else if cfg.mcp_cmd_len > 0 {
-                        // Route any non-shell tool through the MCP bridge.
-                        let (mcp_out_ptr, mcp_out_len, mcp_ok) = mini_mcp_call_tool(
-                            cfg.mcp_cmd_ptr, cfg.mcp_cmd_len,
-                            call.name_ptr, call.name_len,
+                    } else if cfg.mcp_servers.len() > 0 {
+                        // Route the tool to its MCP server (<server>__<tool>
+                        // when several are configured). A call failure is
+                        // explicit: the run aborts instead of feeding the
+                        // model a synthetic "(mcp call failed)" string.
+                        let (ridx, rname_ptr, rname_len, rok) = mini_mcp_route(
+                            cfg.mcp_servers, mcp_multi,
+                            call.name_ptr, call.name_len);
+                        if rok != true {
+                            println("scodex-mini: mcp: cannot route tool to a server, aborting run");
+                            sa_print_bytes(call.name_ptr, call.name_len);
+                            sa_print_bytes(STR_PTR("\n"), 1);
+                            return (1, p);
+                        };
+                        let rsrv = cfg.mcp_servers[ridx];
+                        let (mcp_out_ptr, mcp_out_len, mcp_err) = mini_mcp_call_tool(
+                            rsrv,
+                            rname_ptr, rname_len,
                             call.args_ptr, call.args_len
                         );
-                        if mcp_ok == true {
-                            out_ptr = mcp_out_ptr;
-                            out_len = mcp_out_len;
-                        } else {
-                            out_ptr = STR_PTR("(mcp call failed)");
-                            out_len = STR_LEN("(mcp call failed)");
+                        if mcp_err != 0 {
+                            println("scodex-mini: mcp tool call failed, aborting run");
+                            return (1, p);
                         };
+                        out_ptr = mcp_out_ptr;
+                        out_len = mcp_out_len;
                     } else {
                         out_ptr = STR_PTR("(unknown tool)");
                         out_len = STR_LEN("(unknown tool)");

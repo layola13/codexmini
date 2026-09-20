@@ -11,6 +11,7 @@
 @import "model.sla"
 @import "image.sla"
 @import "sandbox.sla"
+@import "tools.sla"
 
 
 // mini_cli_arg(idx): argv[idx] as (ptr, len, ok). ok=false when missing,
@@ -54,41 +55,6 @@ fn mini_cli_join_from(from: u64) -> (ptr, u64, bool) {
 
 // mini_cli_arg(idx): argv[idx] as (ptr, len, ok). ok=false when missing,
 // out of range, or empty.
-
-// mini_cli_parse_u64: parses an all-digit ASCII string. Non-digit -> (0, false).
-// NOTE: written without a u8->u64 `as` cast — that cast shape triggers
-// error.CodegenError in the SAB lowering path (2026-09-18).
-fn mini_cli_parse_u64(p: ptr, len: u64) -> (u64, bool) {
-    if len == 0 {
-        return (0, false);
-    };
-    var v: u64;
-    v = 0;
-    let i: u64 = 0;
-    while i < len {
-        let bp = X_PTR_ADD(p, i);
-        let b = X_LOAD_U8(bp);
-        if b < 48 {
-            return (0, false);
-        };
-        if b > 57 {
-            return (0, false);
-        };
-        v = v * 10;
-        if b == 48 { v = v + 0; };
-        if b == 49 { v = v + 1; };
-        if b == 50 { v = v + 2; };
-        if b == 51 { v = v + 3; };
-        if b == 52 { v = v + 4; };
-        if b == 53 { v = v + 5; };
-        if b == 54 { v = v + 6; };
-        if b == 55 { v = v + 7; };
-        if b == 56 { v = v + 8; };
-        if b == 57 { v = v + 9; };
-        i = i + 1;
-    }
-    return (v, true);
-}
 
 // mini_cli_join_range(from): joins argv[from..] with single spaces into a
 // heap string. ok=false when from is out of range.
@@ -300,7 +266,7 @@ fn main() -> i32 {
             let sid: u64 = 0;
             let sidok: bool = false;
             if a2ok == true {
-                let (psid, pok) = mini_cli_parse_u64(a2p, a2l);
+                let (psid, pok) = mini_parse_u64(a2p, a2l);
                 sid = psid;
                 sidok = pok;
             };

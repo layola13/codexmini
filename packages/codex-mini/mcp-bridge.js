@@ -49,7 +49,7 @@ async function main() {
       let msg;
       try { msg = JSON.parse(line); } catch { continue; }
       if (msg.id !== undefined && pending.has(msg.id)) {
-        pending.get(msg.id)(msg);
+        pending.get(msg.id).resolve(msg);
         pending.delete(msg.id);
       }
     }
@@ -57,7 +57,7 @@ async function main() {
 
   function send(obj) {
     return new Promise((resolve, reject) => {
-      if (obj.id !== undefined) pending.set(obj.id, resolve);
+      if (obj.id !== undefined) pending.set(obj.id, { resolve, reject, method: obj.method });
       else resolve();
       child.stdin.write(JSON.stringify(obj) + "\n", (err) => {
         if (err) reject(err);
@@ -73,6 +73,18 @@ async function main() {
   child.on("error", (e) => {
     console.error("mcp-bridge: spawn failed: " + e.message);
     process.exit(1);
+  });
+
+  // If the server dies mid-handshake (e.g. instant exit), pending requests
+  // would hang forever. Reject them so the caller gets an explicit error.
+  let exited = false;
+  child.on("exit", (code, signal) => {
+    exited = true;
+    const why = signal ? ("signal " + signal) : ("code " + code);
+    for (const [id, p] of pending) {
+      p.reject(new Error("mcp server exited during " + p.method + " (" + why + ")"));
+    }
+    pending.clear();
   });
 
   try {

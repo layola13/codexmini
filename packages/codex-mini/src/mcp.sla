@@ -8,155 +8,637 @@
 @import "sa_std/encoding/json.sa"
 @import "jsonx.sa"
 @import "tools.sla"
+@import "sessionx.sa"
+@import "sa_std/process.sa"
+@import "sa_std/time.sai"
+@import "sa_std/fs.sa"
 
-// MCP support via an external node bridge (mcp-bridge.js).
-// The bridge speaks JSON-RPC 2.0 over stdio to the MCP server and prints
-// result JSON to stdout. scodex-mini shells out to it per operation.
-// Bridge path: $SCODEX_MCP_BRIDGE, or ./mcp-bridge.js by default.
+// ---------------------------------------------------------------------------
+// MCP client (agent-layer plugin system).
+//
+// Transport: every operation (list / call) spawns a fresh `mcp-bridge.js`
+// (node) helper which speaks newline-delimited JSON-RPC 2.0 over stdio to
+// the real MCP server: initialize -> notifications/initialized ->
+// tools/list | tools/call, then exits. The bridge is a transport shim only;
+// all client logic (config, registry, timeouts, routing, error surfacing)
+// is pure SLA here.
+//
+// Why not pure-SLA stdio? sa_std has no way to write to a spawned child's
+// stdin: sa_std_process_spawn_stream returns process/stdout/stderr handles
+// only, and no process_write_stdin / pipe API exists (verified against
+// ~/.sa/std/process.sai and the Zig runtime, which only dup2's
+// stdout/stderr). A FIFO workaround was rejected: sa_std file opens/reads
+// have no timeout, so a hung server would hang the client with no way to
+// enforce the timeout gate. Bridge-per-operation gives timeouts via
+// spawn + try_wait poll + kill_process_group (the bridge runs setsid'd so
+// the MCP server dies with it).
+// ---------------------------------------------------------------------------
+
+// One configured MCP server: display name + effective shell command.
+// The command already folds env assignments, command and quoted args:
+//   [K='v' ... ]command[ 'a1' 'a2' ...]
+struct MiniMcpServer {
+    name_ptr: ptr,
+    name_len: u64,
+    cmd_ptr: ptr,
+    cmd_len: u64,
+}
+
+// Tool set listed from one server, for request injection.
+// pfx is "" for a single server, "<server>__" when several are configured.
+struct MiniMcpToolSet {
+    tools_ptr: ptr,
+    tools_len: u64,
+    pfx_ptr: ptr,
+    pfx_len: u64,
+}
+
+// Constructors (same-file struct literals; cross-file literals break the
+// compiler's on-demand body re-parse, see mini_config_servers_from_json).
+fn mini_mcp_server_new(name_ptr: ptr, name_len: u64, c_ptr: ptr, c_len: u64) -> MiniMcpServer {
+    let srv = MiniMcpServer { name_ptr: name_ptr, name_len: name_len, cmd_ptr: c_ptr, cmd_len: c_len };
+    return srv;
+}
+
+fn mini_mcp_toolset_new(t_ptr: ptr, t_len: u64, p_ptr: ptr, p_len: u64) -> MiniMcpToolSet {
+    let ts = MiniMcpToolSet { tools_ptr: t_ptr, tools_len: t_len, pfx_ptr: p_ptr, pfx_len: p_len };
+    return ts;
+}
+
+// Bridge op error codes: 0=ok, 1=spawn failed, 2=timeout,
+// 3=bridge exited non-zero, 4=empty bridge output, 5=args write failed.
+fn mini_mcp_err_text(code: u64) -> (ptr, u64) {
+    if code == 0 { return (STR_PTR("ok"), STR_LEN("ok")); };
+    if code == 1 { return (STR_PTR("spawn failed"), STR_LEN("spawn failed")); };
+    if code == 2 { return (STR_PTR("timeout"), STR_LEN("timeout")); };
+    if code == 3 { return (STR_PTR("bridge exited non-zero"), STR_LEN("bridge exited non-zero")); };
+    if code == 4 { return (STR_PTR("empty bridge output"), STR_LEN("empty bridge output")); };
+    if code == 5 { return (STR_PTR("args write failed"), STR_LEN("args write failed")); };
+    return (STR_PTR("unknown error"), STR_LEN("unknown error"));
+}
 
 fn mini_mcp_bridge_path() -> (ptr, u64) {
-    let st = sa_env_has(STR_PTR("SCODEX_MCP_BRIDGE"), STR_LEN("SCODEX_MCP_BRIDGE"));
-    if st == 0 {
-        let buf = ENV_GET_PTR(STR_PTR("SCODEX_MCP_BRIDGE"), STR_LEN("SCODEX_MCP_BRIDGE"));
-        let len = ENV_BUFFER_LEN(buf);
-        if len != 0 {
-            let dref = ENV_BUFFER_DATA(buf);
-            let dptr: ptr = dref;
-            return (dptr, len);
+    // 1. explicit override
+    let ep: ptr = PTR_NULL();
+    let el: u64 = 0;
+    if sa_env_has(STR_PTR("SCODEX_MCP_BRIDGE"), STR_LEN("SCODEX_MCP_BRIDGE")) == 0 {
+        let ebuf = ENV_GET_PTR(STR_PTR("SCODEX_MCP_BRIDGE"), STR_LEN("SCODEX_MCP_BRIDGE"));
+        el = ENV_BUFFER_LEN(ebuf);
+        ep = ENV_BUFFER_DATA(ebuf);
+    };
+    if el > 0 {
+        if sa_std_fs_exists(ep, el) == 0 {
+            return (ep, el);
         };
+        println("scodex-mini: SCODEX_MCP_BRIDGE points at a missing file, ignored");
     };
-    return (STR_PTR("./mcp-bridge.js"), STR_LEN("./mcp-bridge.js"));
+    // 2. ./mcp-bridge.js (run from the package dir)
+    if sa_std_fs_exists(STR_PTR("mcp-bridge.js"), STR_LEN("mcp-bridge.js")) == 0 {
+        return (STR_PTR("mcp-bridge.js"), STR_LEN("mcp-bridge.js"));
+    };
+    // 3. repo layout: ./packages/codex-mini/mcp-bridge.js
+    let rp = STR_PTR("packages/codex-mini/mcp-bridge.js");
+    let rl = STR_LEN("packages/codex-mini/mcp-bridge.js");
+    if sa_std_fs_exists(rp, rl) == 0 {
+        return (rp, rl);
+    };
+    // 4. last resort: bare name; spawn will fail explicitly if missing.
+    return (STR_PTR("mcp-bridge.js"), STR_LEN("mcp-bridge.js"));
 }
 
-// Build: node '<bridge>' --server '<server_cmd>' <mode> [extra...]
-// Returns (cmd_ptr, cmd_len). Caller must ensure server_cmd lives long enough.
-fn mini_mcp_build_cmd(
-    server_ptr: ptr, server_len: u64,
-    mode_ptr: ptr, mode_len: u64,
-    extra_ptr: ptr, extra_len: u64
-) -> (ptr, u64) {
-    let (bridge_ptr, bridge_len) = mini_mcp_bridge_path();
-    let p_node = STR_PTR("node '");
-    let p1 = STR_PTR("' --server '");
-    let p2 = STR_PTR("' ");
-    // node '<bridge>' --server '<server>' <mode>[ <extra>]
-    // p_node=6, p1=12, p2=2
-    let total = 6 + bridge_len + 12 + server_len + 2 + mode_len + extra_len;
-    let out = X_HEAP_BUF_PTR(total);
-    var off: u64;
-    off = 0;
-    X_COPY_BYTES(X_PTR_ADD(out, off), p_node, 6);
-    off = off + 6;
-    X_COPY_BYTES(X_PTR_ADD(out, off), bridge_ptr, bridge_len);
-    off = off + bridge_len;
-    X_COPY_BYTES(X_PTR_ADD(out, off), p1, 12);
-    off = off + 12;
-    X_COPY_BYTES(X_PTR_ADD(out, off), server_ptr, server_len);
-    off = off + server_len;
-    X_COPY_BYTES(X_PTR_ADD(out, off), p2, 2);
-    off = off + 2;
-    X_COPY_BYTES(X_PTR_ADD(out, off), mode_ptr, mode_len);
-    off = off + mode_len;
-    if extra_len > 0 {
-        X_STORE_U8(X_PTR_ADD(out, off), 32);
-        off = off + 1;
-        X_COPY_BYTES(X_PTR_ADD(out, off), extra_ptr, extra_len);
-        off = off + extra_len;
-    };
-    return (out, off);
-}
-
-// List tools from the MCP server. Returns (tools_json_ptr, tools_json_len, ok).
-// tools_json is the raw {"tools": [...]} object printed by the bridge.
-fn mini_mcp_list_tools(server_ptr: ptr, server_len: u64) -> (ptr, u64, bool) {
-    let (cmd_ptr, cmd_len) = mini_mcp_build_cmd(
-        server_ptr, server_len,
-        STR_PTR("list"), STR_LEN("list"),
-        PTR_NULL(), 0
-    );
-    let exec = mini_shell_exec(cmd_ptr, cmd_len);
-    if exec.ok != true {
-        println("scodex-mini: mcp list failed (bridge error)");
-        return (PTR_NULL(), 0, false);
-    };
-    if exec.code != 0 {
-        println("scodex-mini: mcp list failed");
-        return (PTR_NULL(), 0, false);
-    };
-    if exec.out_len == 0 {
-        println("scodex-mini: mcp list empty");
-        return (PTR_NULL(), 0, false);
-    };
-    return (exec.out_ptr, exec.out_len, true);
-}
-
-// Quote a string for sh single-quote context by wrapping in quotes.
-// NOTE: does NOT escape embedded single quotes; tool names from MCP
-// are [A-Za-z0-9_.-] by spec. Returns (ptr, len).
+// mini_mcp_sh_quote: wraps bytes in single quotes, escaping inner quotes.
+// Config values are trusted local config, but a stray quote must not break
+// the command line.
 fn mini_mcp_sh_quote(sptr: ptr, slen: u64) -> (ptr, u64) {
-    let total = slen + 2;
+    var extra: u64;
+    extra = 0;
+    var i: u64;
+    i = 0;
+    while i < slen {
+        let b = X_LOAD_U8(X_PTR_ADD(sptr, i));
+        if b == 39 { extra = extra + 3; };
+        i = i + 1;
+    }
+    let total = slen + extra + 2;
     let out = X_HEAP_BUF_PTR(total);
     X_STORE_U8(out, 39);
-    X_COPY_BYTES(X_PTR_ADD(out, 1), sptr, slen);
-    X_STORE_U8(X_PTR_ADD(out, 1 + slen), 39);
+    var off: u64;
+    off = 1;
+    i = 0;
+    while i < slen {
+        let b = X_LOAD_U8(X_PTR_ADD(sptr, i));
+        if b == 39 {
+            X_STORE_U8(X_PTR_ADD(out, off), 39);
+            X_STORE_U8(X_PTR_ADD(out, off + 1), 92);
+            X_STORE_U8(X_PTR_ADD(out, off + 2), 39);
+            X_STORE_U8(X_PTR_ADD(out, off + 3), 39);
+            off = off + 4;
+        } else {
+            X_STORE_U8(X_PTR_ADD(out, off), b);
+            off = off + 1;
+        };
+        i = i + 1;
+    }
+    X_STORE_U8(X_PTR_ADD(out, off), 39);
     return (out, total);
 }
 
-// Call an MCP tool. args_json is written to a temp file to avoid quoting.
-// Returns (result_text_ptr, result_text_len, ok).
-fn mini_mcp_call_tool(
-    server_ptr: ptr, server_len: u64,
-    name_ptr: ptr, name_len: u64,
-    args_ptr: ptr, args_len: u64
-) -> (ptr, u64, bool) {
-    // Write args to temp file.
-    let tmp_path = STR_PTR("/tmp/scodex-mcp-args.json");
-    let tmp_len = STR_LEN("/tmp/scodex-mcp-args.json");
-    if sa_fs_write_file(tmp_path, tmp_len, args_ptr, args_len) != 0 {
-        println("scodex-mini: mcp args write failed");
-        return (PTR_NULL(), 0, false);
+// mini_mcp_timeout_ms: per-op timeout. which: 0=list, 1=call.
+// Overridable via SCODEX_MCP_LIST_TIMEOUT_MS / SCODEX_MCP_CALL_TIMEOUT_MS.
+fn mini_mcp_timeout_ms(which: u64) -> u64 {
+    var def: u64;
+    def = 30000;
+    var env_ptr: ptr;
+    env_ptr = STR_PTR("SCODEX_MCP_LIST_TIMEOUT_MS");
+    var env_len: u64;
+    env_len = STR_LEN("SCODEX_MCP_LIST_TIMEOUT_MS");
+    if which == 1 {
+        def = 120000;
+        env_ptr = STR_PTR("SCODEX_MCP_CALL_TIMEOUT_MS");
+        env_len = STR_LEN("SCODEX_MCP_CALL_TIMEOUT_MS");
     };
-    let (qname_ptr, qname_len) = mini_mcp_sh_quote(name_ptr, name_len);
-    let (qtmp_ptr, qtmp_len) = mini_mcp_sh_quote(tmp_path, tmp_len);
-    // extra = '<tool>' '<args_file>'
-    let extra_total = qname_len + 1 + qtmp_len;
-    let extra = X_HEAP_BUF_PTR(extra_total);
-    X_COPY_BYTES(extra, qname_ptr, qname_len);
-    X_STORE_U8(X_PTR_ADD(extra, qname_len), 32);
-    X_COPY_BYTES(X_PTR_ADD(extra, qname_len + 1), qtmp_ptr, qtmp_len);
-    let (cmd_ptr, cmd_len) = mini_mcp_build_cmd(
-        server_ptr, server_len,
-        STR_PTR("call"), STR_LEN("call"),
-        extra, extra_total
-    );
-    let exec = mini_shell_exec(cmd_ptr, cmd_len);
+    let vp: ptr = PTR_NULL();
+    let vl: u64 = 0;
+    if sa_env_has(env_ptr, env_len) == 0 {
+        let vbuf = ENV_GET_PTR(env_ptr, env_len);
+        vl = ENV_BUFFER_LEN(vbuf);
+        vp = ENV_BUFFER_DATA(vbuf);
+    };
+    if vl == 0 {
+        return def;
+    };
+    let (v, ok) = mini_parse_u64(vp, vl);
+    if ok != true {
+        return def;
+    };
+    if v == 0 {
+        return def;
+    };
+    return v;
+}
+
+// mini_mcp_tmpdir: fresh private temp dir for one bridge op.
+fn mini_mcp_tmpdir() -> (ptr, u64, bool) {
+    let exec = mini_shell_exec(
+        STR_PTR("mktemp -d /tmp/scodex-mcp-XXXXXX"),
+        STR_LEN("mktemp -d /tmp/scodex-mcp-XXXXXX"));
     if exec.ok != true {
         return (PTR_NULL(), 0, false);
     };
-    if exec.code != 0 {
+    if exec.out_len == 0 {
         return (PTR_NULL(), 0, false);
     };
-    // Bridge prints {"text": "...", "isError": false}. Extract text.
-    let root = JSON_PARSE(exec.out_ptr, exec.out_len);
-    if root == PTR_NULL() {
+    var len: u64;
+    len = exec.out_len;
+    let last = X_LOAD_U8(X_PTR_ADD(exec.out_ptr, len - 1));
+    if last == 10 {
+        len = len - 1;
+    };
+    if len == 0 {
         return (PTR_NULL(), 0, false);
     };
-    let tkey = STR_PTR("text");
-    let tslot: ptr = PTR_NULL();
-    if sa_json_object_get(root, tkey, STR_LEN("text"), &tslot) != 0 {
-        return (PTR_NULL(), 0, false);
-    };
-    if tslot == PTR_NULL() {
-        return (PTR_NULL(), 0, false);
-    };
-    let sref = sa_json_string_ptr(tslot);
-    let sptr: ptr = sref;
-    let slen = sa_json_string_len(tslot);
-    return (sptr, slen, true);
+    return (exec.out_ptr, len, true);
 }
 
-@test "mcp bridge path default"() {
-    let (p, l) = mini_mcp_bridge_path();
-    if l == 0 { panic(601); };
-    if p == PTR_NULL() { panic(602); };
+fn mini_mcp_cleanup_tmp(tmp_ptr: ptr, tmp_len: u64) {
+    let (qptr, qlen) = mini_mcp_sh_quote(tmp_ptr, tmp_len);
+    let total = STR_LEN("rm -rf ") + qlen;
+    let buf = X_HEAP_BUF_PTR(total);
+    X_COPY_BYTES(buf, STR_PTR("rm -rf "), STR_LEN("rm -rf "));
+    X_COPY_BYTES(X_PTR_ADD(buf, STR_LEN("rm -rf ")), qptr, qlen);
+    mini_shell_exec(buf, total);
+}
+
+// mini_mcp_log_err: explicit one-line error naming the server.
+fn mini_mcp_log_err(srv: MiniMcpServer, code: u64) {
+    sa_print_bytes(STR_PTR("scodex-mini: mcp server '"), STR_LEN("scodex-mini: mcp server '"));
+    sa_print_bytes(srv.name_ptr, srv.name_len);
+    sa_print_bytes(STR_PTR("': "), STR_LEN("': "));
+    let (tp, tl) = mini_mcp_err_text(code);
+    sa_print_bytes(tp, tl);
+    sa_print_bytes(STR_PTR("\n"), 1);
+}
+
+// mini_mcp_read_file: read whole file up to cap bytes.
+fn mini_mcp_read_file(pptr: ptr, plen: u64, cap: u64) -> (ptr, u64) {
+    let fbuf: u64 = 0;
+    if sa_std_fs_read_to_string(pptr, plen, cap, &fbuf) != 0 {
+        return (PTR_NULL(), 0);
+    };
+    let blen = sa_fs_read_buffer_len(fbuf);
+    if blen == 0 {
+        return (PTR_NULL(), 0);
+    };
+    let bref = sa_fs_read_buffer_data(fbuf);
+    let bptr: ptr = bref;
+    return (bptr, blen);
+}
+
+// mini_mcp_run_op: run one bridge op (list | call) with a timeout.
+// Returns (out_ptr, out_len, err_code). err_code != 0 means the op failed;
+// the caller must surface it (never silently continue).
+fn mini_mcp_run_op(
+    srv: MiniMcpServer,
+    is_call: u64,
+    tool_ptr: ptr, tool_len: u64,
+    args_ptr: ptr, args_len: u64,
+    timeout_ms: u64,
+) -> (ptr, u64, u64) {
+    let (tmp_ptr, tmp_len, tmp_ok) = mini_mcp_tmpdir();
+    if tmp_ok != true {
+        mini_mcp_log_err(srv, 1);
+        return (PTR_NULL(), 0, 1);
+    };
+
+    // call mode: write args JSON to <tmp>/args.json
+    var args_path_ptr: ptr;
+    args_path_ptr = PTR_NULL();
+    var args_path_len: u64;
+    args_path_len = 0;
+    if is_call != 0 {
+        let atotal = tmp_len + STR_LEN("/args.json");
+        let abuf = X_HEAP_BUF_PTR(atotal);
+        X_COPY_BYTES(abuf, tmp_ptr, tmp_len);
+        X_COPY_BYTES(X_PTR_ADD(abuf, tmp_len), STR_PTR("/args.json"), STR_LEN("/args.json"));
+        args_path_ptr = abuf;
+        args_path_len = atotal;
+        if sa_fs_write_file(abuf, atotal, args_ptr, args_len) != 0 {
+            mini_mcp_log_err(srv, 5);
+            mini_mcp_cleanup_tmp(tmp_ptr, tmp_len);
+            return (PTR_NULL(), 0, 5);
+        };
+    };
+
+    // out/err capture paths
+    let out_total = tmp_len + STR_LEN("/out.json");
+    let out_buf = X_HEAP_BUF_PTR(out_total);
+    X_COPY_BYTES(out_buf, tmp_ptr, tmp_len);
+    X_COPY_BYTES(X_PTR_ADD(out_buf, tmp_len), STR_PTR("/out.json"), STR_LEN("/out.json"));
+    let err_total = tmp_len + STR_LEN("/err.txt");
+    let err_buf = X_HEAP_BUF_PTR(err_total);
+    X_COPY_BYTES(err_buf, tmp_ptr, tmp_len);
+    X_COPY_BYTES(X_PTR_ADD(err_buf, tmp_len), STR_PTR("/err.txt"), STR_LEN("/err.txt"));
+
+    // node '<bridge>' --server '<server>' list >'<out>' 2>'<err>'
+    // node '<bridge>' --server '<server>' call '<tool>' '<args>' >'<out>' 2>'<err>'
+    let (bridge_ptr, bridge_len) = mini_mcp_bridge_path();
+    let (qb_ptr, qb_len) = mini_mcp_sh_quote(bridge_ptr, bridge_len);
+    let (qs_ptr, qs_len) = mini_mcp_sh_quote(srv.cmd_ptr, srv.cmd_len);
+    let (qo_ptr, qo_len) = mini_mcp_sh_quote(out_buf, out_total);
+    let (qe_ptr, qe_len) = mini_mcp_sh_quote(err_buf, err_total);
+
+    var cmd_total: u64;
+    cmd_total = STR_LEN("node ") + qb_len + STR_LEN(" --server ") + qs_len + 5 + qo_len + 3 + qe_len;
+    var qt_ptr: ptr;
+    qt_ptr = PTR_NULL();
+    var qt_len: u64;
+    qt_len = 0;
+    var qa_ptr: ptr;
+    qa_ptr = PTR_NULL();
+    var qa_len: u64;
+    qa_len = 0;
+    if is_call != 0 {
+        let (qtp, qtl) = mini_mcp_sh_quote(tool_ptr, tool_len);
+        let (qap, qal) = mini_mcp_sh_quote(args_path_ptr, args_path_len);
+        qt_ptr = qtp;
+        qt_len = qtl;
+        qa_ptr = qap;
+        qa_len = qal;
+        cmd_total = cmd_total + 1 + qt_len + 1 + qa_len;
+    };
+    let cbuf = X_HEAP_BUF_PTR(cmd_total);
+    var coff: u64;
+    coff = 0;
+    X_COPY_BYTES(cbuf, STR_PTR("node "), STR_LEN("node "));
+    coff = coff + STR_LEN("node ");
+    X_COPY_BYTES(X_PTR_ADD(cbuf, coff), qb_ptr, qb_len);
+    coff = coff + qb_len;
+    X_COPY_BYTES(X_PTR_ADD(cbuf, coff), STR_PTR(" --server "), STR_LEN(" --server "));
+    coff = coff + STR_LEN(" --server ");
+    X_COPY_BYTES(X_PTR_ADD(cbuf, coff), qs_ptr, qs_len);
+    coff = coff + qs_len;
+    if is_call != 0 {
+        X_COPY_BYTES(X_PTR_ADD(cbuf, coff), STR_PTR(" call "), STR_LEN(" call "));
+        coff = coff + STR_LEN(" call ");
+        X_COPY_BYTES(X_PTR_ADD(cbuf, coff), qt_ptr, qt_len);
+        coff = coff + qt_len;
+        X_STORE_U8(X_PTR_ADD(cbuf, coff), 32);
+        coff = coff + 1;
+        X_COPY_BYTES(X_PTR_ADD(cbuf, coff), qa_ptr, qa_len);
+        coff = coff + qa_len;
+    } else {
+        X_COPY_BYTES(X_PTR_ADD(cbuf, coff), STR_PTR(" list"), STR_LEN(" list"));
+        coff = coff + STR_LEN(" list");
+    };
+    X_COPY_BYTES(X_PTR_ADD(cbuf, coff), STR_PTR(" >"), STR_LEN(" >"));
+    coff = coff + STR_LEN(" >");
+    X_COPY_BYTES(X_PTR_ADD(cbuf, coff), qo_ptr, qo_len);
+    coff = coff + qo_len;
+    X_COPY_BYTES(X_PTR_ADD(cbuf, coff), STR_PTR(" 2>"), STR_LEN(" 2>"));
+    coff = coff + STR_LEN(" 2>");
+    X_COPY_BYTES(X_PTR_ADD(cbuf, coff), qe_ptr, qe_len);
+    coff = coff + qe_len;
+
+    // spawn `sh -c <cmd>` setsid'd: the bridge's whole process group
+    // (bridge + MCP server) can be killed on timeout.
+    let sh_ptr = STR_PTR("sh");
+    let sh_len = STR_LEN("sh");
+    let dc_ptr = STR_PTR("-c");
+    let dc_len = STR_LEN("-c");
+    let argv = [0u64, 0u64, 0u64, 0u64, 0u64, 0u64];
+    X_ARGV_FILL(&argv, sh_ptr, sh_len, dc_ptr, dc_len, cbuf, coff);
+    let proc_slot: u64 = 0;
+    let sst = sa_std_process_spawn_command_ext(&argv, 3, PTR_NULL(), 0, 0, PTR_NULL(), 0, 0, 0, 0, 1, &proc_slot);
+    if sst != 0 {
+        mini_mcp_log_err(srv, 1);
+        mini_mcp_cleanup_tmp(tmp_ptr, tmp_len);
+        return (PTR_NULL(), 0, 1);
+    };
+    let proc: u64 = proc_slot;
+
+    // poll with timeout
+    var iters: u64;
+    iters = timeout_ms / 50;
+    if iters == 0 {
+        iters = 1;
+    };
+    var exited: u64;
+    exited = 0;
+    var ecode: u64;
+    ecode = 0;
+    var i: u64;
+    i = 0;
+    while i < iters {
+        let ready_slot: u32 = 0;
+        let code_slot: u32 = 0;
+        let wst = sa_std_process_try_wait(proc, &ready_slot, &code_slot);
+        if wst != 0 {
+            sa_std_process_kill_process_group(proc);
+            sa_std_process_close(proc);
+            mini_mcp_log_err(srv, 1);
+            mini_mcp_cleanup_tmp(tmp_ptr, tmp_len);
+            return (PTR_NULL(), 0, 1);
+        };
+        if ready_slot != 0 {
+            exited = 1;
+            ecode = code_slot as u64;
+            i = iters;
+        } else {
+            sa_time_sleep_ms(50);
+            i = i + 1;
+        };
+    }
+    if exited == 0 {
+        // timeout: kill the whole group (bridge + MCP server), reap, bail.
+        sa_std_process_kill_process_group(proc);
+        let wc_slot: u32 = 0;
+        sa_std_process_wait(proc, &wc_slot);
+        sa_std_process_close(proc);
+        mini_mcp_log_err(srv, 2);
+        mini_mcp_cleanup_tmp(tmp_ptr, tmp_len);
+        return (PTR_NULL(), 0, 2);
+    };
+    sa_std_process_close(proc);
+
+    if ecode != 0 {
+        mini_mcp_log_err(srv, 3);
+        let (eptr, elen) = mini_mcp_read_file(err_buf, err_total, 4096);
+        if elen > 0 {
+            sa_print_bytes(eptr, elen);
+            sa_print_bytes(STR_PTR("\n"), 1);
+        };
+        mini_mcp_cleanup_tmp(tmp_ptr, tmp_len);
+        return (PTR_NULL(), 0, 3);
+    };
+
+    let (optr, olen) = mini_mcp_read_file(out_buf, out_total, 1048576);
+    mini_mcp_cleanup_tmp(tmp_ptr, tmp_len);
+    if olen == 0 {
+        mini_mcp_log_err(srv, 4);
+        return (PTR_NULL(), 0, 4);
+    };
+    return (optr, olen, 0);
+}
+
+// mini_mcp_list_tools: returns (tools_json, len, err_code).
+// tools_json is the raw bridge stdout: {"tools":[...]}.
+fn mini_mcp_list_tools(srv: MiniMcpServer) -> (ptr, u64, u64) {
+    return mini_mcp_run_op(srv, 0, PTR_NULL(), 0, PTR_NULL(), 0, mini_mcp_timeout_ms(0));
+}
+
+// mini_mcp_call_tool: returns (result_text, len, err_code).
+// result_text is the raw bridge stdout: the MCP content text (or JSON).
+fn mini_mcp_call_tool(
+    srv: MiniMcpServer,
+    name_ptr: ptr, name_len: u64,
+    args_ptr: ptr, args_len: u64,
+) -> (ptr, u64, u64) {
+    return mini_mcp_run_op(srv, 1, name_ptr, name_len, args_ptr, args_len, mini_mcp_timeout_ms(1));
+}
+
+// mini_mcp_route: map an injected tool name back to (server index, raw name).
+// Single server: name passes through. Multiple: "<server>__<tool>".
+// Returns (index, tool_ptr, tool_len, ok).
+fn mini_mcp_route(
+    servers: Vec<MiniMcpServer>,
+    multi: u64,
+    name_ptr: ptr, name_len: u64,
+) -> (u64, ptr, u64, bool) {
+    if multi == 0 {
+        return (0, name_ptr, name_len, true);
+    };
+    var idx: u64;
+    idx = 0;
+    while idx < servers.len() {
+        let srv = servers[idx];
+        let n = srv.name_len;
+        if name_len > n + 2 {
+            var same: u64;
+            same = 1;
+            var k: u64;
+            k = 0;
+            while k < n {
+                let a = X_LOAD_U8(X_PTR_ADD(name_ptr, k));
+                let b = X_LOAD_U8(X_PTR_ADD(srv.name_ptr, k));
+                if a != b {
+                    same = 0;
+                    k = n;
+                } else {
+                    k = k + 1;
+                };
+            }
+            if same == 1 {
+                let u1 = X_LOAD_U8(X_PTR_ADD(name_ptr, n));
+                let u2 = X_LOAD_U8(X_PTR_ADD(name_ptr, n + 1));
+                if u1 == 95 {
+                    if u2 == 95 {
+                        return (idx, X_PTR_ADD(name_ptr, n + 2), name_len - n - 2, true);
+                    };
+                };
+            };
+        };
+        idx = idx + 1;
+    }
+    return (0, PTR_NULL(), 0, false);
+}
+
+// mini_mcp_build_server_cmd: fold a configured server object into one
+// effective shell command: [K='v' ... ]command[ 'a1' 'a2' ...].
+// srv_node: {"command": "...", "args": [...], "env": {...}}.
+// "command" is required; "args" (array of strings) and "env" (string map)
+// are optional. A malformed entry makes the server invalid (skipped with a
+// warning, never silently misconfigured).
+fn mini_mcp_build_server_cmd(srv_node: ptr) -> (ptr, u64, bool) {
+    let has_cmd: bool = false;
+    X_OBJ_HAS(has_cmd, srv_node, STR_PTR("command"), STR_LEN("command"));
+    if has_cmd != true {
+        println("scodex-mini: mcp config: server entry missing \"command\", skipped");
+        return (PTR_NULL(), 0, false);
+    };
+    let cmd_ptr: ptr = PTR_NULL();
+    let cmd_len: u64 = 0;
+    X_OBJ_STR_PTR(cmd_ptr, srv_node, STR_PTR("command"), STR_LEN("command"));
+    X_OBJ_STR_LEN(cmd_len, srv_node, STR_PTR("command"), STR_LEN("command"));
+    if cmd_len == 0 {
+        println("scodex-mini: mcp config: server entry has empty \"command\", skipped");
+        return (PTR_NULL(), 0, false);
+    };
+
+    let buf = X_HEAP_BUF_PTR(65536);
+    var off: u64;
+    off = 0;
+    var bad: u64;
+    bad = 0;
+
+    // env assignments first
+    let has_env: bool = false;
+    X_OBJ_HAS(has_env, srv_node, STR_PTR("env"), STR_LEN("env"));
+    if has_env == true {
+        let env_node: ptr = PTR_NULL();
+        let eget = sa_json_object_get(srv_node, STR_PTR("env"), STR_LEN("env"), &env_node);
+        if eget != 0 {
+            bad = 1;
+        } else {
+            let is_obj: bool = false;
+            JSON_IS_OBJECT(is_obj, env_node);
+            if is_obj != true {
+                println("scodex-mini: mcp config: \"env\" must be an object, server skipped");
+                bad = 1;
+            } else {
+                var ei: u64;
+                ei = 0;
+                var env_done: u64;
+                env_done = 0;
+                while env_done == 0 {
+                    let kptr: ptr = PTR_NULL();
+                    let klen: u64 = 0;
+                    let kst = sa_json_object_key_at(env_node, ei, &kptr, &klen);
+                    if kst != 0 {
+                        env_done = 1;
+                    } else {
+                        let vs_ptr: ptr = PTR_NULL();
+                        let vs_len: u64 = 0;
+                        let vst = sa_json_object_get_string(env_node, kptr, klen, &vs_ptr, &vs_len);
+                        if vst != 0 {
+                            println("scodex-mini: mcp config: env values must be strings, server skipped");
+                            bad = 1;
+                            env_done = 1;
+                        } else {
+                            let (qk_ptr, qk_len) = mini_mcp_sh_quote(kptr, klen);
+                            let (qv_ptr, qv_len) = mini_mcp_sh_quote(vs_ptr, vs_len);
+                            let need = qk_len + 1 + qv_len + 1;
+                            if off + need > 65536 {
+                                bad = 1;
+                                env_done = 1;
+                            } else {
+                                X_COPY_BYTES(X_PTR_ADD(buf, off), qk_ptr, qk_len);
+                                off = off + qk_len;
+                                X_STORE_U8(X_PTR_ADD(buf, off), 61);
+                                off = off + 1;
+                                X_COPY_BYTES(X_PTR_ADD(buf, off), qv_ptr, qv_len);
+                                off = off + qv_len;
+                                X_STORE_U8(X_PTR_ADD(buf, off), 32);
+                                off = off + 1;
+                                ei = ei + 1;
+                            };
+                        };
+                    };
+                }
+            };
+        };
+    };
+
+    // command (raw: it is a shell fragment by design, e.g. "npx -y ...")
+    if bad == 0 {
+        if off + cmd_len > 65536 {
+            bad = 1;
+        } else {
+            X_COPY_BYTES(X_PTR_ADD(buf, off), cmd_ptr, cmd_len);
+            off = off + cmd_len;
+        };
+    };
+
+    // args, each shell-quoted
+    if bad == 0 {
+        let has_args: bool = false;
+        X_OBJ_HAS(has_args, srv_node, STR_PTR("args"), STR_LEN("args"));
+        if has_args == true {
+            let args_node: ptr = PTR_NULL();
+            let aget = sa_json_object_get(srv_node, STR_PTR("args"), STR_LEN("args"), &args_node);
+            if aget != 0 {
+                bad = 1;
+            } else {
+                let is_arr: bool = false;
+                JSON_IS_ARRAY(is_arr, args_node);
+                if is_arr != true {
+                    println("scodex-mini: mcp config: \"args\" must be an array, server skipped");
+                    bad = 1;
+                } else {
+                    let cnt: u64 = 0;
+                    let cnt_st = sa_json_value_count(args_node, &cnt);
+                    if cnt_st == 0 {
+                        var ai: u64;
+                        ai = 0;
+                        while ai < cnt {
+                            if bad != 0 {
+                                ai = cnt;
+                            } else {
+                                let el: ptr = PTR_NULL();
+                                let elst = sa_json_array_get(args_node, ai, &el);
+                                if elst != 0 {
+                                    bad = 1;
+                                } else {
+                                    let is_str: bool = false;
+                                    JSON_IS_STRING(is_str, el);
+                                    if is_str != true {
+                                        println("scodex-mini: mcp config: \"args\" entries must be strings, server skipped");
+                                        bad = 1;
+                                    } else {
+                                        let elref = sa_json_string_ptr(el);
+                                        let elp: ptr = elref;
+                                        let ell = sa_json_string_len(el);
+                                        let (qa_ptr, qa_len) = mini_mcp_sh_quote(elp, ell);
+                                        if off + 1 + qa_len > 65536 {
+                                            bad = 1;
+                                        } else {
+                                            X_STORE_U8(X_PTR_ADD(buf, off), 32);
+                                            off = off + 1;
+                                            X_COPY_BYTES(X_PTR_ADD(buf, off), qa_ptr, qa_len);
+                                            off = off + qa_len;
+                                        };
+                                    };
+                                };
+                                ai = ai + 1;
+                            };
+                        }
+                    };
+                };
+            };
+        };
+    };
+
+    if bad != 0 {
+        return (PTR_NULL(), 0, false);
+    };
+    return (buf, off, true);
 }
