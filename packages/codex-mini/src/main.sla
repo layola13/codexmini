@@ -302,7 +302,7 @@ fn main() -> i32 {
                 return 2;
             };
             let cfg = mini_config_apply_mcp(cfg0, mcp_ptr, mcp_len);
-            let (st, next_seq, items) = session_resume_load(sid);
+            let (st, next_seq, items) = session_resume_load(cfg, sid);
             if st != 0 {
                 return 1;
             };

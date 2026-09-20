@@ -973,6 +973,10 @@ fn session_db_ensure() -> bool {
         println("scodex-mini: db init failed (sessions idx)");
         return false;
     };
+    // Context compaction table (P0-2): append-only summaries, safe on --list.
+    if compact_ensure_table(root, root_len) != true {
+        return false;
+    };
     return true;
 }
 
@@ -1131,6 +1135,779 @@ fn session_bump(session_id: u64, msg_count: u64) -> bool {
 }
 
 
+// ---- Context compaction (P0-2) ----
+// Bounds the prompt injected by --resume to cfg.compaction_budget estimated
+// tokens (default 32000 via SCODEX_COMPACTION_BUDGET; SCODEX_COMPACTION=0
+// disables). Short sessions that fit the budget take the old path byte for
+// byte identical: no marker, no reordering.
+//
+// A `compactions` table stores append-only summary rows:
+//   (session_id, from_seq, to_seq, created_ms, summary_blob)
+// Each row covers raw messages with seq in [from_seq, to_seq). A new
+// compaction only ever summarizes RAW messages — never an existing summary —
+// so repeated compactions cannot degenerate into summaries of summaries.
+// Raw messages are never deleted: if a summary row is lost or corrupt, the
+// next resume simply re-summarizes the raw messages (safe direction, no data
+// loss).
+
+struct CompactMsg {
+    seq: u64,
+    role: u64,
+    body_ptr: ptr,
+    body_len: u64,
+}
+
+struct CompactRow {
+    from_seq: u64,
+    to_seq: u64,
+    summary_ptr: ptr,
+    summary_len: u64,
+}
+
+struct CompactionDbRow {
+    session_id: u64,
+    from_seq: u64,
+    to_seq: u64,
+    created_ms: u64,
+    summary_blob: u64,
+}
+
+// Rough token estimate: ~4 bytes per token. Conservative for CJK/UTF-8,
+// optimistic for base64; good enough for a budget heuristic.
+fn compact_estimate_tokens(body_len: u64) -> u64 {
+    // Conservative: ~3 bytes per token (CJK-heavy text), rounded up,
+    // plus a fixed per-message framing overhead.
+    return (body_len + 2) / 3 + 8;
+}
+
+@test "compaction token estimate"() {
+    if compact_estimate_tokens(400) != 142 { panic(711); };
+    if compact_estimate_tokens(3) != 9 { panic(712); };
+    if compact_estimate_tokens(0) != 8 { panic(713); };
+}
+
+// Plans which raw messages to summarize: returns the cutoff index into the
+// (seq-ordered) message arrays. Messages [0, cutoff) are summarized,
+// [cutoff, n) are kept raw. The cutoff always lands on a turn boundary (a
+// message with role 0=user or 4=user-image starts a turn), so an
+// assistant/function_call/output group is never split, and at least the
+// newest turn is always kept even if it alone exceeds avail.
+fn compact_plan_cutoff(ests: Vec<u64>, roles: Vec<u64>, avail: u64) -> u64 {
+    let n = ests.len();
+    if n == 0 {
+        return 0;
+    };
+    let starts: Vec<u64> = Vec::new();
+    starts.push(0);
+    let i: u64 = 1;
+    while i < n {
+        let r = roles[i];
+        if r == 0 {
+            starts.push(i);
+        };
+        if r == 4 {
+            starts.push(i);
+        };
+        i = i + 1;
+    }
+    let nturns = starts.len();
+    var acc: u64;
+    acc = 0;
+    var cutoff: u64;
+    cutoff = starts[nturns - 1];
+    var stop: bool;
+    stop = false;
+    var ti: u64;
+    ti = nturns;
+    while ti > 0 {
+        if stop != true {
+            let k = ti - 1;
+            let s = starts[k];
+            var e: u64;
+            e = n;
+            if k + 1 < nturns {
+                e = starts[k + 1];
+            };
+            var test: u64;
+            test = 0;
+            var m: u64;
+            m = s;
+            while m < e {
+                test = test + ests[m];
+                m = m + 1;
+            }
+            if acc + test <= avail {
+                acc = acc + test;
+                cutoff = s;
+            } else {
+                stop = true;
+            };
+        };
+        ti = ti - 1;
+    }
+    return cutoff;
+}
+
+@test "compaction cutoff planner"() {
+    let ests: Vec<u64> = Vec::new();
+    ests.push(100);
+    ests.push(100);
+    ests.push(200);
+    ests.push(200);
+    ests.push(300);
+    let roles: Vec<u64> = Vec::new();
+    roles.push(0);
+    roles.push(1);
+    roles.push(0);
+    roles.push(1);
+    roles.push(0);
+    // avail 500: newest turn (300) fits; +middle turn (400) = 700 > 500.
+    if compact_plan_cutoff(ests, roles, 500) != 4 { panic(721); };
+    // avail huge: everything fits, nothing to summarize.
+    if compact_plan_cutoff(ests, roles, 10000) != 0 { panic(722); };
+    // avail 0: newest turn still kept.
+    if compact_plan_cutoff(ests, roles, 0) != 4 { panic(723); };
+    // function_call/output belong to the assistant turn; image starts a turn.
+    let ests2: Vec<u64> = Vec::new();
+    ests2.push(50);
+    ests2.push(50);
+    ests2.push(50);
+    ests2.push(50);
+    ests2.push(50);
+    let roles2: Vec<u64> = Vec::new();
+    roles2.push(0);
+    roles2.push(2);
+    roles2.push(3);
+    roles2.push(1);
+    roles2.push(4);
+    // avail 50: newest (image) turn kept; nothing else fits.
+    if compact_plan_cutoff(ests2, roles2, 50) != 4 { panic(724); };
+    // avail 250: all fit.
+    if compact_plan_cutoff(ests2, roles2, 250) != 0 { panic(725); };
+}
+
+fn session_db_compactions_schema() -> (ptr, u64) {
+    // DDL text is fixed; STR_LEN miscompiles the length of this literal
+    // (toolchain bug), so the length is hardcoded. 215 bytes incl. \n.
+    let p = STR_PTR("#def MAX_ROWS = 4096\n#def COL_SESSION_ID_STRIDE = 8 // u64\n#def COL_FROM_SEQ_STRIDE = 8 // u64\n#def COL_TO_SEQ_STRIDE = 8 // u64\n#def COL_CREATED_MS_STRIDE = 8 // u64\n#def COL_SUMMARY_BLOB_STRIDE = 8 // blob_handle\n");
+    let l: u64 = 215;
+    return (p, l);
+}
+
+// Creates the compactions table + (session_id, from_seq) pair index when
+// missing. Called from session_db_ensure; safe to run on --list (no key).
+fn compact_ensure_table(root: ptr, root_len: u64) -> bool {
+    let tn = STR_PTR("compactions");
+    let tnl = STR_LEN("compactions");
+    let h: ptr = PTR_NULL();
+    let ost = sa_db_open_read_table(root, root_len, tn, tnl, &h);
+    if ost == 0 {
+        sa_db_close_read_table(h);
+    };
+    if ost != 0 {
+        let info = DbTableInfo { row_count: 0, segment_count: 0, epoch: 0, locked: 0 };
+        let (sp, sl) = session_db_compactions_schema();
+        let st = sa_db_init_schema(root, root_len,
+            STR_PTR("compactions.sadb-schema"), STR_LEN("compactions.sadb-schema"),
+            sp, sl, &info);
+        if st != 0 {
+            println("scodex-mini: db init failed (compactions)");
+            return false;
+        };
+    };
+    let ci = DbTableInfo { row_count: 0, segment_count: 0, epoch: 0, locked: 0 };
+    let cst = sa_db_create_u64_pair_index(root, root_len, tn, tnl, 0, 1, 0, &ci);
+    if cst != 0 {
+        println("scodex-mini: db init failed (compactions index)");
+        return false;
+    };
+    return true;
+}
+
+// Loads a session's compaction rows ordered by from_seq (the pair index on
+// (session_id, from_seq) yields ascending from_seq). A corrupt row is never
+// silently skipped: it aborts the load with an error; raw messages are still
+// in the DB, so resume degrades to re-summarizing instead of losing data.
+fn compact_load_rows(session_id: u64) -> (Vec<CompactRow>, bool) {
+    let out: Vec<CompactRow> = Vec::new();
+    let (root, root_len) = session_db_root();
+    let tn = STR_PTR("compactions");
+    let tnl = STR_LEN("compactions");
+    let h: ptr = PTR_NULL();
+    if sa_db_open_read_table(root, root_len, tn, tnl, &h) != 0 {
+        println("scodex-mini: session db error");
+        return (out, false);
+    };
+    let probe: u64 = 0;
+    let w: u64 = 0;
+    let total: u64 = 0;
+    if sa_db_filter_u64_pair_key1_handle(h, 0, 1, session_id, 0, 0, &probe, 1, &w, &total) != 0 {
+        println("scodex-mini: session db error");
+        sa_db_close_read_table(h);
+        return (out, false);
+    };
+    if total == 0 {
+        sa_db_close_read_table(h);
+        return (out, true);
+    };
+    let rows_ptr = X_HEAP_BUF_PTR(total * 8);
+    let w2: u64 = 0;
+    let total2: u64 = 0;
+    if sa_db_filter_u64_pair_key1_handle(h, 0, 1, session_id, 0, total, rows_ptr, total, &w2, &total2) != 0 {
+        println("scodex-mini: session db error");
+        sa_db_close_read_table(h);
+        return (out, false);
+    };
+    let store = STR_PTR("texts");
+    let store_len = STR_LEN("texts");
+    let i: u64 = 0;
+    while i < total {
+        let ri = X_ROW_GET_U64(rows_ptr, i);
+        let r = CompactionDbRow { session_id: 0, from_seq: 0, to_seq: 0, created_ms: 0, summary_blob: 0 };
+        if sa_db_get_row_handle(h, ri, &r, 40) != 0 {
+            println("scodex-mini: corrupt compaction record (session {})", session_id);
+            sa_db_close_read_table(h);
+            return (out, false);
+        };
+        let found: u64 = 0;
+        let blen: u64 = 0;
+        if sa_db_blob_value_len_handle(h, store, store_len, r.summary_blob, &found, &blen) != 0 {
+            println("scodex-mini: corrupt compaction record (session {})", session_id);
+            sa_db_close_read_table(h);
+            return (out, false);
+        };
+        if found != 1 {
+            println("scodex-mini: corrupt compaction record (session {})", session_id);
+            sa_db_close_read_table(h);
+            return (out, false);
+        };
+        let bbuf: ptr = PTR_NULL();
+        if blen > 0 {
+            bbuf = X_HEAP_BUF_PTR(blen);
+            let found2: u64 = 0;
+            let written: u64 = 0;
+            if sa_db_blob_value_copy_handle(h, store, store_len, r.summary_blob, bbuf, blen, &found2, &written) != 0 {
+                println("scodex-mini: corrupt compaction record (session {})", session_id);
+                sa_db_close_read_table(h);
+                return (out, false);
+            };
+        };
+        out.push(CompactRow { from_seq: r.from_seq, to_seq: r.to_seq, summary_ptr: bbuf, summary_len: blen });
+        i = i + 1;
+    }
+    sa_db_close_read_table(h);
+    return (out, true);
+}
+
+// Appends one summary row covering raw messages [from_seq, to_seq).
+fn compact_store_row(session_id: u64, from_seq: u64, to_seq: u64, summary_ptr: ptr, summary_len: u64) -> bool {
+    let (root, root_len) = session_db_root();
+    let tn = STR_PTR("compactions");
+    let tnl = STR_LEN("compactions");
+    let bid: u64 = 0;
+    let binfo = DbTableInfo { row_count: 0, segment_count: 0, epoch: 0, locked: 0 };
+    if sa_db_blob_put(root, root_len, tn, tnl,
+        STR_PTR("texts"), STR_LEN("texts"),
+        summary_ptr, summary_len, &bid, &binfo) != 0 {
+        println("scodex-mini: compaction save failed");
+        return false;
+    };
+    let now_ms = sa_time_unix_ms();
+    let now_u: u64 = now_ms as u64;
+    let row = CompactionDbRow { session_id: session_id, from_seq: from_seq, to_seq: to_seq, created_ms: now_u, summary_blob: bid };
+    let iinfo = DbTableInfo { row_count: 0, segment_count: 0, epoch: 0, locked: 0 };
+    if sa_db_insert_row(root, root_len, tn, tnl, &row, 40, &iinfo) != 0 {
+        println("scodex-mini: compaction save failed");
+        return false;
+    };
+    return true;
+}
+
+// Concatenates two byte strings into a fresh heap buffer.
+fn compact_concat(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64) -> (ptr, u64) {
+    let total = a_len + b_len;
+    if total == 0 {
+        return (PTR_NULL(), 0);
+    };
+    let buf = X_HEAP_BUF_PTR(total);
+    if a_len > 0 {
+        X_COPY_BYTES(buf, a_ptr, a_len);
+    };
+    if b_len > 0 {
+        X_COPY_BYTES(X_PTR_ADD(buf, a_len), b_ptr, b_len);
+    };
+    return (buf, total);
+}
+
+// Renders one message as labeled plain text for the summarization prompt.
+// Tool calls keep name+args; tool outputs are truncated to 2000 bytes; image
+// messages contribute their text caption only (never base64). JSON parse
+// failures fall back to the raw body — nothing is silently dropped.
+fn compact_render_message(role: u64, body_ptr: ptr, body_len: u64) -> (ptr, u64) {
+    if role == 0 {
+        return compact_concat(STR_PTR("[用户]\n"), STR_LEN("[用户]\n"), body_ptr, body_len);
+    };
+    if role == 1 {
+        return compact_concat(STR_PTR("[助手]\n"), STR_LEN("[助手]\n"), body_ptr, body_len);
+    };
+    if role == 4 {
+        let tk = STR_PTR("text");
+        let tkl = STR_LEN("text");
+        let cap = STR_PTR("[用户（图片消息）]\n");
+        let capl = STR_LEN("[用户（图片消息）]\n");
+        let broot = JSON_PARSE(body_ptr, body_len);
+        if broot != PTR_NULL() {
+            if X_OBJ_HAS(broot, tk, tkl) == true {
+                let txp = X_OBJ_STR_PTR(broot, tk, tkl);
+                let txl = X_OBJ_STR_LEN(broot, tk, tkl);
+                if txp != PTR_NULL() {
+                    return compact_concat(cap, capl, txp, txl);
+                };
+            };
+        };
+        return compact_concat(cap, capl, body_ptr, body_len);
+    };
+    if role == 2 {
+        let nk = STR_PTR("name");
+        let nkl = STR_LEN("name");
+        let ak = STR_PTR("args");
+        let akl = STR_LEN("args");
+        let broot = JSON_PARSE(body_ptr, body_len);
+        if broot != PTR_NULL() {
+            if X_OBJ_HAS(broot, nk, nkl) == true {
+                if X_OBJ_HAS(broot, ak, akl) == true {
+                    let nmp = X_OBJ_STR_PTR(broot, nk, nkl);
+                    let nml = X_OBJ_STR_LEN(broot, nk, nkl);
+                    let agp = X_OBJ_STR_PTR(broot, ak, akl);
+                    let agl = X_OBJ_STR_LEN(broot, ak, akl);
+                    if nmp != PTR_NULL() {
+                        if agp != PTR_NULL() {
+                            let (h1, hl1) = compact_concat(STR_PTR("[工具调用 "), STR_LEN("[工具调用 "), nmp, nml);
+                            let (h2, hl2) = compact_concat(h1, hl1, STR_PTR("]\nargs="), STR_LEN("]\nargs="));
+                            return compact_concat(h2, hl2, agp, agl);
+                        };
+                    };
+                };
+            };
+        };
+        return compact_concat(STR_PTR("[工具调用]\n"), STR_LEN("[工具调用]\n"), body_ptr, body_len);
+    };
+    if role == 3 {
+        let ok = STR_PTR("output");
+        let okl = STR_LEN("output");
+        let broot = JSON_PARSE(body_ptr, body_len);
+        if broot != PTR_NULL() {
+            if X_OBJ_HAS(broot, ok, okl) == true {
+                let outp = X_OBJ_STR_PTR(broot, ok, okl);
+                let outl = X_OBJ_STR_LEN(broot, ok, okl);
+                if outp != PTR_NULL() {
+                    var tl: u64;
+                    tl = outl;
+                    if tl > 2000 {
+                        tl = 2000;
+                    };
+                    let (h1, hl1) = compact_concat(STR_PTR("[工具输出]\n"), STR_LEN("[工具输出]\n"), outp, tl);
+                    if outl > 2000 {
+                        return compact_concat(h1, hl1, STR_PTR("\n…[输出截断]"), STR_LEN("\n…[输出截断]"));
+                    };
+                    return (h1, hl1);
+                };
+            };
+        };
+        return compact_concat(STR_PTR("[工具输出]\n"), STR_LEN("[工具输出]\n"), body_ptr, body_len);
+    };
+    return compact_concat(STR_PTR("[未知角色]\n"), STR_LEN("[未知角色]\n"), body_ptr, body_len);
+}
+
+// Builds the summarization prompt: instruction header + labeled turns.
+// The SCODEX_COMPACT_REQ sentinel lets test mocks recognize the request
+// without touching real model traffic.
+fn compact_build_prompt(msgs: Vec<CompactMsg>, count: u64) -> (ptr, u64) {
+    let head = STR_PTR("SCODEX_COMPACT_REQ\n你是对话压缩器。请把下面按时间顺序排列的历史对话轮次压缩成一段简洁的中文摘要，供后续对话继续时参考。\n要求：\n1. 保留所有关键决策、结论和重要事实，一条都不要遗漏。\n2. 工具调用只保留摘要：调用了什么工具/命令、关键参数、是否成功、重要输出（错误信息必须保留）。\n3. 保留重要文件路径、用户明确提出的要求和偏好。\n4. 省略寒暄和无信息量的重复内容。\n5. 直接输出摘要正文，不要开场白，不要用代码块包裹。\n\n历史对话：\n");
+    let head_len = STR_LEN("SCODEX_COMPACT_REQ\n你是对话压缩器。请把下面按时间顺序排列的历史对话轮次压缩成一段简洁的中文摘要，供后续对话继续时参考。\n要求：\n1. 保留所有关键决策、结论和重要事实，一条都不要遗漏。\n2. 工具调用只保留摘要：调用了什么工具/命令、关键参数、是否成功、重要输出（错误信息必须保留）。\n3. 保留重要文件路径、用户明确提出的要求和偏好。\n4. 省略寒暄和无信息量的重复内容。\n5. 直接输出摘要正文，不要开场白，不要用代码块包裹。\n\n历史对话：\n");
+    var acc_ptr: ptr;
+    acc_ptr = head;
+    var acc_len: u64;
+    acc_len = head_len;
+    let i: u64 = 0;
+    while i < count {
+        let m = msgs[i];
+        let (rp, rl) = compact_render_message(m.role, m.body_ptr, m.body_len);
+        let (s1, sl1) = compact_concat(acc_ptr, acc_len, STR_PTR("\n---\n"), STR_LEN("\n---\n"));
+        let (s2, sl2) = compact_concat(s1, sl1, rp, rl);
+        acc_ptr = s2;
+        acc_len = sl2;
+        i = i + 1;
+    }
+    return (acc_ptr, acc_len);
+}
+
+// Extracts the summary text from a non-streaming model response. Returns a
+// (ptr, len) borrowing the response body — the caller must heap-copy before
+// freeing the HTTP response.
+fn compact_extract_summary_text(api_mode: u64, body_ptr: ptr, body_len: u64) -> (ptr, u64, bool) {
+    let nullp: ptr = PTR_NULL();
+    let root = JSON_PARSE(body_ptr, body_len);
+    if root == PTR_NULL() {
+        return (nullp, 0, false);
+    };
+    if api_mode == 1 {
+        // Chat: choices[0].message.content (string; ignores tool_calls).
+        let ck = STR_PTR("choices");
+        let ckl = STR_LEN("choices");
+        let mk = STR_PTR("message");
+        let mkl = STR_LEN("message");
+        let tk = STR_PTR("content");
+        let tkl = STR_LEN("content");
+        if X_OBJ_HAS(root, ck, ckl) != true { return (nullp, 0, false); };
+        let ch_slot: ptr = PTR_NULL();
+        if sa_json_object_get(root, ck, ckl, &ch_slot) != 0 { return (nullp, 0, false); };
+        let c0_slot: ptr = PTR_NULL();
+        if sa_json_array_get(ch_slot, 0, &c0_slot) != 0 { return (nullp, 0, false); };
+        if X_OBJ_HAS(c0_slot, mk, mkl) != true { return (nullp, 0, false); };
+        let msg_slot: ptr = PTR_NULL();
+        if sa_json_object_get(c0_slot, mk, mkl, &msg_slot) != 0 { return (nullp, 0, false); };
+        if X_OBJ_HAS(msg_slot, tk, tkl) != true { return (nullp, 0, false); };
+        let tp = X_OBJ_STR_PTR(msg_slot, tk, tkl);
+        let tl = X_OBJ_STR_LEN(msg_slot, tk, tkl);
+        if tp == PTR_NULL() { return (nullp, 0, false); };
+        return (tp, tl, true);
+    };
+    // Responses: output[] item with type=="message" -> content[0].text.
+    let ok = STR_PTR("output");
+    let okl = STR_LEN("output");
+    let tyk = STR_PTR("type");
+    let tykl = STR_LEN("type");
+    let ctk = STR_PTR("content");
+    let ctkl = STR_LEN("content");
+    let txk = STR_PTR("text");
+    let txkl = STR_LEN("text");
+    if X_OBJ_HAS(root, ok, okl) != true { return (nullp, 0, false); };
+    let out_slot: ptr = PTR_NULL();
+    if sa_json_object_get(root, ok, okl, &out_slot) != 0 { return (nullp, 0, false); };
+    let cnt_slot: u64 = 0;
+    if sa_json_value_count(out_slot, &cnt_slot) != 0 { return (nullp, 0, false); };
+    let n = cnt_slot;
+    let i: u64 = 0;
+    while i < n {
+        let item_slot: ptr = PTR_NULL();
+        if sa_json_array_get(out_slot, i, &item_slot) == 0 {
+            let item = item_slot;
+            if X_OBJ_HAS(item, tyk, tykl) == true {
+                let itp = X_OBJ_STR_PTR(item, tyk, tykl);
+                let itl = X_OBJ_STR_LEN(item, tyk, tykl);
+                if mini_model_str_eq(itp, itl, STR_PTR("message"), STR_LEN("message")) == true {
+                    if X_OBJ_HAS(item, ctk, ctkl) == true {
+                        let c_slot: ptr = PTR_NULL();
+                        if sa_json_object_get(item, ctk, ctkl, &c_slot) == 0 {
+                            let c0_slot: ptr = PTR_NULL();
+                            if sa_json_array_get(c_slot, 0, &c0_slot) == 0 {
+                                if X_OBJ_HAS(c0_slot, txk, txkl) == true {
+                                    let tp = X_OBJ_STR_PTR(c0_slot, txk, txkl);
+                                    let tl = X_OBJ_STR_LEN(c0_slot, txk, txkl);
+                                    if tp != PTR_NULL() {
+                                        return (tp, tl, true);
+                                    };
+                                };
+                            };
+                        };
+                    };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    return (nullp, 0, false);
+}
+
+// Sends one non-streaming summarization request. Never uses the SSE path:
+// the internal summary must not leak onto the user's stdout. Returns a
+// heap-owned copy of the summary text.
+fn compact_summarize(url_ptr: ptr, url_len: u64, cfg: MiniConfig, prompt_ptr: ptr, prompt_len: u64) -> (ptr, u64, bool) {
+    let nullp: ptr = PTR_NULL();
+    let items: Vec<MiniInputItem> = Vec::new();
+    items.push(mini_input_user(prompt_ptr, prompt_len));
+    let json_buf = mini_model_build_request_dispatch(cfg, items, nullp, 0, nullp, 0);
+    if json_buf == PTR_NULL() {
+        return (nullp, 0, false);
+    };
+    let body_ref = sa_json_buffer_data(json_buf);
+    let body_ptr: ptr = body_ref;
+    let body_len = sa_json_buffer_len(json_buf);
+    let resp = mini_http_post_json(url_ptr, url_len, body_ptr, body_len, cfg.api_key_ptr, cfg.api_key_len);
+    if resp.ok != true {
+        mini_http_response_free(resp);
+        return (nullp, 0, false);
+    };
+    if resp.status != 200 {
+        mini_http_response_free(resp);
+        return (nullp, 0, false);
+    };
+    let (tp, tl, tok) = compact_extract_summary_text(cfg.api_mode, resp.body_ptr, resp.body_len);
+    if tok != true {
+        mini_http_response_free(resp);
+        return (nullp, 0, false);
+    };
+    if tl == 0 {
+        mini_http_response_free(resp);
+        return (nullp, 0, false);
+    };
+    let (cp, cl) = compact_concat(tp, tl, nullp, 0);
+    mini_http_response_free(resp);
+    return (cp, cl, true);
+}
+
+// Converts one loaded message into a request item, preserving the exact
+// corrupt-record diagnostics of the original resume path. Returns (item, ok);
+// the item is only valid when ok is true.
+fn session_compact_msg_to_item(session_id: u64, seq: u64, role: u64, bptr: ptr, blen: u64) -> (MiniInputItem, bool) {
+    let dummy = mini_input_user(PTR_NULL(), 0);
+    if role == 0 {
+        return (mini_input_user(bptr, blen), true);
+    };
+    if role == 4 {
+        // User image message: {"text","img","mime"} JSON blob.
+        let broot4 = JSON_PARSE(bptr, blen);
+        let tk = STR_PTR("text");
+        let tkl = STR_LEN("text");
+        let ik = STR_PTR("img");
+        let ikl = STR_LEN("img");
+        let mk = STR_PTR("mime");
+        let mkl = STR_LEN("mime");
+        if broot4 != PTR_NULL() {
+            if X_OBJ_HAS(broot4, tk, tkl) == true {
+                if X_OBJ_HAS(broot4, ik, ikl) == true {
+                    if X_OBJ_HAS(broot4, mk, mkl) == true {
+                        let txp = X_OBJ_STR_PTR(broot4, tk, tkl);
+                        let txl = X_OBJ_STR_LEN(broot4, tk, tkl);
+                        let imp = X_OBJ_STR_PTR(broot4, ik, ikl);
+                        let iml = X_OBJ_STR_LEN(broot4, ik, ikl);
+                        let mip = X_OBJ_STR_PTR(broot4, mk, mkl);
+                        let mil = X_OBJ_STR_LEN(broot4, mk, mkl);
+                        if txp != PTR_NULL() {
+                            if imp != PTR_NULL() {
+                                if mip != PTR_NULL() {
+                                    if iml > 0 {
+                                        if mil > 0 {
+                                            return (mini_input_user_image(txp, txl, imp, iml, mip, mil), true);
+                                        };
+                                    };
+                                };
+                            };
+                        };
+                    };
+                };
+            };
+        };
+        println("scodex-mini: corrupt image message record (session {} seq {})", session_id, seq);
+        return (dummy, false);
+    };
+    if role == 1 {
+        return (mini_input_assistant(bptr, blen), true);
+    };
+    if role == 2 {
+        let broot = JSON_PARSE(bptr, blen);
+        let ck = STR_PTR("call_id");
+        let ckl = STR_LEN("call_id");
+        let nk = STR_PTR("name");
+        let nkl = STR_LEN("name");
+        let ak = STR_PTR("args");
+        let akl = STR_LEN("args");
+        if broot != PTR_NULL() {
+            if X_OBJ_HAS(broot, ck, ckl) == true {
+                if X_OBJ_HAS(broot, nk, nkl) == true {
+                    if X_OBJ_HAS(broot, ak, akl) == true {
+                        let cidp = X_OBJ_STR_PTR(broot, ck, ckl);
+                        let cidl = X_OBJ_STR_LEN(broot, ck, ckl);
+                        let nmp = X_OBJ_STR_PTR(broot, nk, nkl);
+                        let nml = X_OBJ_STR_LEN(broot, nk, nkl);
+                        let agp = X_OBJ_STR_PTR(broot, ak, akl);
+                        let agl = X_OBJ_STR_LEN(broot, ak, akl);
+                        if cidp != PTR_NULL() {
+                            if nmp != PTR_NULL() {
+                                if agp != PTR_NULL() {
+                                    if cidl > 0 {
+                                        if nml > 0 {
+                                            return (mini_input_func_call(cidp, cidl, nmp, nml, agp, agl), true);
+                                        };
+                                    };
+                                };
+                            };
+                        };
+                    };
+                };
+            };
+        };
+        println("scodex-mini: corrupt function_call record (session {} seq {})", session_id, seq);
+        return (dummy, false);
+    };
+    if role == 3 {
+        let broot3 = JSON_PARSE(bptr, blen);
+        let ck = STR_PTR("call_id");
+        let ckl = STR_LEN("call_id");
+        let ok = STR_PTR("output");
+        let okl = STR_LEN("output");
+        if broot3 != PTR_NULL() {
+            if X_OBJ_HAS(broot3, ck, ckl) == true {
+                if X_OBJ_HAS(broot3, ok, okl) == true {
+                    let cidp3 = X_OBJ_STR_PTR(broot3, ck, ckl);
+                    let cidl3 = X_OBJ_STR_LEN(broot3, ck, ckl);
+                    let outp = X_OBJ_STR_PTR(broot3, ok, okl);
+                    let outl = X_OBJ_STR_LEN(broot3, ok, okl);
+                    if cidp3 != PTR_NULL() {
+                        if outp != PTR_NULL() {
+                            if cidl3 > 0 {
+                                return (mini_input_func_output(cidp3, cidl3, outp, outl), true);
+                            };
+                        };
+                    };
+                };
+            };
+        };
+        println("scodex-mini: corrupt function_call_output record (session {} seq {})", session_id, seq);
+        return (dummy, false);
+    };
+    println("scodex-mini: corrupt message role (session {} seq {})", session_id, seq);
+    return (dummy, false);
+}
+
+// Assembles the resume prompt from loaded messages + compaction rows.
+// Summaries are injected first (each explicitly marked as a compressed
+// summary, never disguised as original text), then the raw messages that no
+// summary covers yet. May append one new compaction row when the estimated
+// prompt exceeds cfg.compaction_budget. Returns (status, next_seq, items).
+fn session_resume_assemble(cfg: MiniConfig, session_id: u64, msgs: Vec<CompactMsg>) -> (u64, u64, Vec<MiniInputItem>) {
+    let empty: Vec<MiniInputItem> = Vec::new();
+    let n = msgs.len();
+    var next_seq: u64;
+    next_seq = 0;
+    let qi: u64 = 0;
+    while qi < n {
+        let qm = msgs[qi];
+        if qm.seq + 1 > next_seq {
+            next_seq = qm.seq + 1;
+        };
+        qi = qi + 1;
+    }
+    // Existing summaries: base = first raw seq not yet covered.
+    // When compaction is disabled, ignore summaries entirely (byte-identical
+    // to the pre-compaction loader).
+    let rows: Vec<CompactRow> = Vec::new();
+    var base: u64;
+    base = 0;
+    var est_sum: u64;
+    est_sum = 0;
+    if cfg.compaction_enabled == true {
+        let (lrows, rows_ok) = compact_load_rows(session_id);
+        if rows_ok != true {
+            return (1, 0, empty);
+        };
+        let lni: u64 = 0;
+        while lni < lrows.len() {
+            rows.push(lrows[lni]);
+            lni = lni + 1;
+        }
+    };
+    let nr = rows.len();
+    let ri: u64 = 0;
+    while ri < nr {
+        let rr = rows[ri];
+        if rr.to_seq > base {
+            base = rr.to_seq;
+        };
+        est_sum = est_sum + compact_estimate_tokens(rr.summary_len);
+        ri = ri + 1;
+    }
+    // Raw messages not yet covered by any summary (msgs are in seq order).
+    let raw: Vec<CompactMsg> = Vec::new();
+    let raw_est: Vec<u64> = Vec::new();
+    let raw_roles: Vec<u64> = Vec::new();
+    var est_raw: u64;
+    est_raw = 0;
+    let mi: u64 = 0;
+    while mi < n {
+        let mm = msgs[mi];
+        if mm.seq >= base {
+            raw.push(mm);
+            let e = compact_estimate_tokens(mm.body_len);
+            raw_est.push(e);
+            raw_roles.push(mm.role);
+            est_raw = est_raw + e;
+        };
+        mi = mi + 1;
+    }
+    // Trigger compaction when the estimated prompt exceeds the budget.
+    var keep_from: u64;
+    keep_from = 0;
+    let all_rows: Vec<CompactRow> = Vec::new();
+    let ar: u64 = 0;
+    while ar < nr {
+        all_rows.push(rows[ar]);
+        ar = ar + 1;
+    }
+    if cfg.compaction_enabled == true {
+        if est_sum + est_raw > cfg.compaction_budget {
+            var avail: u64;
+            avail = 0;
+            if cfg.compaction_budget > est_sum + 2000 {
+                avail = cfg.compaction_budget - est_sum - 2000;
+            };
+            let cutoff = compact_plan_cutoff(raw_est, raw_roles, avail);
+            if cutoff > 0 {
+                let to_seq = raw[cutoff].seq;
+                let (pptr, plen) = compact_build_prompt(raw, cutoff);
+                let (url_ptr, url_len) = mini_model_build_url(cfg);
+                let (sptr, slen, sok) = compact_summarize(url_ptr, url_len, cfg, pptr, plen);
+                var fsptr: ptr;
+                fsptr = sptr;
+                var fslen: u64;
+                fslen = slen;
+                var fsok: bool;
+                fsok = sok;
+                if fsok != true {
+                    // One retry; then fail loudly (no silent full-history fallback).
+                    let (sptr2, slen2, sok2) = compact_summarize(url_ptr, url_len, cfg, pptr, plen);
+                    fsptr = sptr2;
+                    fslen = slen2;
+                    fsok = sok2;
+                };
+                if fsok != true {
+                    println("scodex-mini: compaction failed: summarization request failed");
+                    return (1, 0, empty);
+                };
+                if compact_store_row(session_id, base, to_seq, fsptr, fslen) != true {
+                    return (1, 0, empty);
+                };
+                all_rows.push(CompactRow { from_seq: base, to_seq: to_seq, summary_ptr: fsptr, summary_len: fslen });
+                keep_from = cutoff;
+            };
+        };
+    };
+    // Build items: marked summaries first, then raw messages.
+    let items: Vec<MiniInputItem> = Vec::new();
+    let marker = STR_PTR("[系统注：以下是压缩摘要（非原文），之后为未压缩的近期消息。]\n");
+    let marker_len = STR_LEN("[系统注：以下是压缩摘要（非原文），之后为未压缩的近期消息。]\n");
+    let sr: u64 = 0;
+    while sr < all_rows.len() {
+        let srow = all_rows[sr];
+        let (mp, ml) = compact_concat(marker, marker_len, srow.summary_ptr, srow.summary_len);
+        items.push(mini_input_user(mp, ml));
+        sr = sr + 1;
+    }
+    let km: u64 = keep_from;
+    while km < raw.len() {
+        let rm = raw[km];
+        let (it, iok) = session_compact_msg_to_item(session_id, rm.seq, rm.role, rm.body_ptr, rm.body_len);
+        if iok != true {
+            return (1, 0, empty);
+        };
+        items.push(it);
+        km = km + 1;
+    }
+    return (0, next_seq, items);
+}
+
+
 // Lists all sessions: one `session id={} msgs={} updated_ms={}` line plus the
 // title line per session. Does not require an API key.
 fn session_list() -> i32 {
@@ -1197,7 +1974,7 @@ fn session_list() -> i32 {
 // NOTE: the vec is created and returned here (not taken as a param) because
 // Vec values are passed by value in .sla — pushes inside a callee are not
 // visible to the caller (verified with a @test probe).
-fn session_resume_load(session_id: u64) -> (u64, u64, Vec<MiniInputItem>) {
+fn session_resume_load(cfg: MiniConfig, session_id: u64) -> (u64, u64, Vec<MiniInputItem>) {
     let empty: Vec<MiniInputItem> = Vec::new();
     if session_db_ensure() != true {
         return (1, 0, empty);
@@ -1232,10 +2009,13 @@ fn session_resume_load(session_id: u64) -> (u64, u64, Vec<MiniInputItem>) {
         sa_db_close_read_table(mh);
         return (1, 0, empty);
     };
-    let items: Vec<MiniInputItem> = Vec::new();
+    // Phase 1: load raw messages. Phase 2 (session_resume_assemble) applies
+    // compaction and converts to request items. Corrupt-record diagnostics
+    // are preserved in session_compact_msg_to_item.
+    let msgs: Vec<CompactMsg> = Vec::new();
     if total == 0 {
         sa_db_close_read_table(mh);
-        return (0, 0, items);
+        return session_resume_assemble(cfg, session_id, msgs);
     };
     let rows_ptr = X_HEAP_BUF_PTR(total * 8);
     let w2: u64 = 0;
@@ -1248,16 +2028,6 @@ fn session_resume_load(session_id: u64) -> (u64, u64, Vec<MiniInputItem>) {
     };
     let store = STR_PTR("texts");
     let store_len = STR_LEN("texts");
-    let ck = STR_PTR("call_id");
-    let ckl = STR_LEN("call_id");
-    let nk = STR_PTR("name");
-    let nkl = STR_LEN("name");
-    let ak = STR_PTR("args");
-    let akl = STR_LEN("args");
-    let ok = STR_PTR("output");
-    let okl = STR_LEN("output");
-    var next_seq: u64;
-    next_seq = 0;
     let i: u64 = 0;
     while i < total {
         let ri = X_ROW_GET_U64(rows_ptr, i);
@@ -1270,9 +2040,6 @@ fn session_resume_load(session_id: u64) -> (u64, u64, Vec<MiniInputItem>) {
         };
         let seq = mrow.seq;
         let role = mrow.role;
-        if seq + 1 > next_seq {
-            next_seq = seq + 1;
-        };
         let found: u64 = 0;
         let blen: u64 = 0;
         let blst = sa_db_blob_value_len_handle(mh, store, store_len, mrow.body_blob, &found, &blen);
@@ -1298,128 +2065,11 @@ fn session_resume_load(session_id: u64) -> (u64, u64, Vec<MiniInputItem>) {
                 return (1, 0, empty);
             };
         };
-        if role == 0 {
-            items.push(mini_input_user(bbuf, blen));
-        } else {
-            if role == 4 {
-                // User image message: {"text","img","mime"} JSON blob.
-                let broot4 = JSON_PARSE(bbuf, blen);
-                let ok4 = false;
-                let tk = STR_PTR("text");
-                let tkl = STR_LEN("text");
-                let ik = STR_PTR("img");
-                let ikl = STR_LEN("img");
-                let mk = STR_PTR("mime");
-                let mkl = STR_LEN("mime");
-                if broot4 != PTR_NULL() {
-                    if X_OBJ_HAS(broot4, tk, tkl) == true {
-                        if X_OBJ_HAS(broot4, ik, ikl) == true {
-                            if X_OBJ_HAS(broot4, mk, mkl) == true {
-                                let txp = X_OBJ_STR_PTR(broot4, tk, tkl);
-                                let txl = X_OBJ_STR_LEN(broot4, tk, tkl);
-                                let imp = X_OBJ_STR_PTR(broot4, ik, ikl);
-                                let iml = X_OBJ_STR_LEN(broot4, ik, ikl);
-                                let mip = X_OBJ_STR_PTR(broot4, mk, mkl);
-                                let mil = X_OBJ_STR_LEN(broot4, mk, mkl);
-                                if txp != PTR_NULL() {
-                                    if imp != PTR_NULL() {
-                                        if mip != PTR_NULL() {
-                                            if iml > 0 {
-                                                if mil > 0 {
-                                                    items.push(mini_input_user_image(txp, txl, imp, iml, mip, mil));
-                                                    ok4 = true;
-                                                };
-                                            };
-                                        };
-                                    };
-                                };
-                            };
-                        };
-                    };
-                };
-                if ok4 != true {
-                    println("scodex-mini: corrupt image message record (session {} seq {})", session_id, seq);
-                    sa_db_close_read_table(mh);
-                    return (1, 0, empty);
-                };
-            } else {
-            if role == 1 {
-                items.push(mini_input_assistant(bbuf, blen));
-            } else {
-                if role == 2 {
-                    let broot = JSON_PARSE(bbuf, blen);
-                    let ok2 = false;
-                    if broot != PTR_NULL() {
-                        if X_OBJ_HAS(broot, ck, ckl) == true {
-                            if X_OBJ_HAS(broot, nk, nkl) == true {
-                                if X_OBJ_HAS(broot, ak, akl) == true {
-                                    let cidp = X_OBJ_STR_PTR(broot, ck, ckl);
-                                    let cidl = X_OBJ_STR_LEN(broot, ck, ckl);
-                                    let nmp = X_OBJ_STR_PTR(broot, nk, nkl);
-                                    let nml = X_OBJ_STR_LEN(broot, nk, nkl);
-                                    let agp = X_OBJ_STR_PTR(broot, ak, akl);
-                                    let agl = X_OBJ_STR_LEN(broot, ak, akl);
-                                    if cidp != PTR_NULL() {
-                                        if nmp != PTR_NULL() {
-                                            if agp != PTR_NULL() {
-                                                if cidl > 0 {
-                                                    if nml > 0 {
-                                                        items.push(mini_input_func_call(cidp, cidl, nmp, nml, agp, agl));
-                                                        ok2 = true;
-                                                    };
-                                                };
-                                            };
-                                        };
-                                    };
-                                };
-                            };
-                        };
-                    };
-                    if ok2 != true {
-                        println("scodex-mini: corrupt function_call record (session {} seq {})", session_id, seq);
-                        sa_db_close_read_table(mh);
-                        return (1, 0, empty);
-                    };
-                } else {
-                    if role == 3 {
-                        let broot3 = JSON_PARSE(bbuf, blen);
-                        let ok3 = false;
-                        if broot3 != PTR_NULL() {
-                            if X_OBJ_HAS(broot3, ck, ckl) == true {
-                                if X_OBJ_HAS(broot3, ok, okl) == true {
-                                    let cidp3 = X_OBJ_STR_PTR(broot3, ck, ckl);
-                                    let cidl3 = X_OBJ_STR_LEN(broot3, ck, ckl);
-                                    let outp = X_OBJ_STR_PTR(broot3, ok, okl);
-                                    let outl = X_OBJ_STR_LEN(broot3, ok, okl);
-                                    if cidp3 != PTR_NULL() {
-                                        if outp != PTR_NULL() {
-                                            if cidl3 > 0 {
-                                                items.push(mini_input_func_output(cidp3, cidl3, outp, outl));
-                                                ok3 = true;
-                                            };
-                                        };
-                                    };
-                                };
-                            };
-                        };
-                        if ok3 != true {
-                            println("scodex-mini: corrupt function_call_output record (session {} seq {})", session_id, seq);
-                            sa_db_close_read_table(mh);
-                            return (1, 0, empty);
-                        };
-                    } else {
-                        println("scodex-mini: corrupt message role (session {} seq {})", session_id, seq);
-                        sa_db_close_read_table(mh);
-                        return (1, 0, empty);
-                    };
-                };
-            };
-            };
-        };
+        msgs.push(CompactMsg { seq: seq, role: role, body_ptr: bbuf, body_len: blen });
         i = i + 1;
     }
     sa_db_close_read_table(mh);
-    return (0, next_seq, items);
+    return session_resume_assemble(cfg, session_id, msgs);
 }
 
 // Parses native sse_turn calls JSON: [{"call_id":"...","name":"...","args":"..."}]
