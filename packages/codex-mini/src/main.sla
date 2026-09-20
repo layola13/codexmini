@@ -117,10 +117,10 @@ fn mini_cli_join_range(from: u64) -> (ptr, u64, bool) {
 // mini_cli_run_image(path_idx): scodex-mini --image <path> <prompt...>
 // Loads the image as base64 and sends it as multimodal input.
 fn mini_cli_run_image(path_idx: u64) -> i32 {
-    return mini_cli_run_image_mcp(path_idx, PTR_NULL(), 0);
+    return mini_cli_run_image_mcp(path_idx, PTR_NULL(), 0, PTR_NULL(), 0);
 }
 
-fn mini_cli_run_image_mcp(path_idx: u64, mcp_ptr: ptr, mcp_len: u64) -> i32 {
+fn mini_cli_run_image_mcp(path_idx: u64, mcp_ptr: ptr, mcp_len: u64, profile_ptr: ptr, profile_len: u64) -> i32 {
     let (ppp, ppl, ppok) = mini_cli_arg(path_idx);
     if ppok != true {
         println("usage: scodex-mini --image <path> <prompt>");
@@ -167,10 +167,10 @@ fn mini_cli_run_image_mcp(path_idx: u64, mcp_ptr: ptr, mcp_len: u64) -> i32 {
 // mini_cli_run_file(path_idx): scodex-mini --file <path> <prompt...>
 // Injects the text file's contents into the prompt as context.
 fn mini_cli_run_file(path_idx: u64) -> i32 {
-    return mini_cli_run_file_mcp(path_idx, PTR_NULL(), 0);
+    return mini_cli_run_file_mcp(path_idx, PTR_NULL(), 0, PTR_NULL(), 0);
 }
 
-fn mini_cli_run_file_mcp(path_idx: u64, mcp_ptr: ptr, mcp_len: u64) -> i32 {
+fn mini_cli_run_file_mcp(path_idx: u64, mcp_ptr: ptr, mcp_len: u64, profile_ptr: ptr, profile_len: u64) -> i32 {
     let (ppp, ppl, ppok) = mini_cli_arg(path_idx);
     if ppok != true {
         println("usage: scodex-mini --file <path> <prompt>");
@@ -325,16 +325,16 @@ fn main() -> i32 {
             return code;
         };
         if mini_model_str_eq(b1p, b1l, STR_PTR("--image"), STR_LEN("--image")) == true {
-            return mini_cli_run_image_mcp(arg_base + 1, mcp_ptr, mcp_len);
+            return mini_cli_run_image_mcp(arg_base + 1, mcp_ptr, mcp_len, profile_ptr, profile_len);
         };
         if mini_model_str_eq(b1p, b1l, STR_PTR("-i"), STR_LEN("-i")) == true {
-            return mini_cli_run_image_mcp(arg_base + 1, mcp_ptr, mcp_len);
+            return mini_cli_run_image_mcp(arg_base + 1, mcp_ptr, mcp_len, profile_ptr, profile_len);
         };
         if mini_model_str_eq(b1p, b1l, STR_PTR("--file"), STR_LEN("--file")) == true {
-            return mini_cli_run_file_mcp(arg_base + 1, mcp_ptr, mcp_len);
+            return mini_cli_run_file_mcp(arg_base + 1, mcp_ptr, mcp_len, profile_ptr, profile_len);
         };
         if mini_model_str_eq(b1p, b1l, STR_PTR("-f"), STR_LEN("-f")) == true {
-            return mini_cli_run_file_mcp(arg_base + 1, mcp_ptr, mcp_len);
+            return mini_cli_run_file_mcp(arg_base + 1, mcp_ptr, mcp_len, profile_ptr, profile_len);
         };
     };
     let cfg0 = mini_config_load_with_profile(profile_ptr, profile_len);
