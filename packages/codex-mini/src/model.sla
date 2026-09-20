@@ -14,6 +14,7 @@
 @import "image.sla"
 @import "skills.sla"
 @import "mcp.sla"
+@import "applypatch.sla"
 @import "plugin_abi/db.sai"
 @import "sa_std/time.sai"
 @import "sessionx.sa"
@@ -210,6 +211,51 @@ fn mini_model_write_mcp_tools(w: ptr, mcp_ptr: ptr, mcp_len: u64, chat_mode: u64
     return true;
 }
 
+// Writes the apply_patch tool schema. chat_mode selects the Chat
+// Completions ("function" wrapper) vs Responses (flat) shape.
+fn mini_model_write_apply_patch_tool(w: ptr, chat_mode: u64) -> void {
+    sa_json_writer_begin_object(w);
+    sa_json_writer_field_string(w, STR_PTR("type"), STR_LEN("type"), STR_PTR("function"), STR_LEN("function"));
+    if chat_mode == 1 {
+        sa_json_writer_object_field(w, STR_PTR("function"), STR_LEN("function"));
+        sa_json_writer_begin_object(w);
+    };
+    sa_json_writer_field_string(w, STR_PTR("name"), STR_LEN("name"), STR_PTR("apply_patch"), STR_LEN("apply_patch"));
+    sa_json_writer_field_string(w, STR_PTR("description"), STR_LEN("description"),
+        STR_PTR("Apply a codex-format patch to the local filesystem. Patch format: '*** Begin Patch' ... '*** Add File: <path>' (+lines) / '*** Delete File: <path>' / '*** Update File: <path>' ('*** Move to: <new>' then '@@' hunks with ' '/- /+ lines) ... '*** End Patch'. Set preview=true to get a unified diff without writing."),
+        STR_LEN("Apply a codex-format patch to the local filesystem. Patch format: '*** Begin Patch' ... '*** Add File: <path>' (+lines) / '*** Delete File: <path>' / '*** Update File: <path>' ('*** Move to: <new>' then '@@' hunks with ' '/- /+ lines) ... '*** End Patch'. Set preview=true to get a unified diff without writing."));
+    sa_json_writer_object_field(w, STR_PTR("parameters"), STR_LEN("parameters"));
+    sa_json_writer_begin_object(w);
+    sa_json_writer_field_string(w, STR_PTR("type"), STR_LEN("type"), STR_PTR("object"), STR_LEN("object"));
+    sa_json_writer_object_field(w, STR_PTR("properties"), STR_LEN("properties"));
+    sa_json_writer_begin_object(w);
+    sa_json_writer_object_field(w, STR_PTR("patch"), STR_LEN("patch"));
+    sa_json_writer_begin_object(w);
+    sa_json_writer_field_string(w, STR_PTR("type"), STR_LEN("type"), STR_PTR("string"), STR_LEN("string"));
+    sa_json_writer_field_string(w, STR_PTR("description"), STR_LEN("description"), STR_PTR("The full patch text."), STR_LEN("The full patch text."));
+    sa_json_writer_end_object(w);
+    sa_json_writer_object_field(w, STR_PTR("preview"), STR_LEN("preview"));
+    sa_json_writer_begin_object(w);
+    sa_json_writer_field_string(w, STR_PTR("type"), STR_LEN("type"), STR_PTR("boolean"), STR_LEN("boolean"));
+    sa_json_writer_field_string(w, STR_PTR("description"), STR_LEN("description"), STR_PTR("When true, return a unified diff without writing any files."), STR_LEN("When true, return a unified diff without writing any files."));
+    sa_json_writer_end_object(w);
+    sa_json_writer_object_field(w, STR_PTR("check"), STR_LEN("check"));
+    sa_json_writer_begin_object(w);
+    sa_json_writer_field_string(w, STR_PTR("type"), STR_LEN("type"), STR_PTR("boolean"), STR_LEN("boolean"));
+    sa_json_writer_field_string(w, STR_PTR("description"), STR_LEN("description"), STR_PTR("When true, run 'sa sla check' on changed .sla files after applying."), STR_LEN("When true, run 'sa sla check' on changed .sla files after applying."));
+    sa_json_writer_end_object(w);
+    sa_json_writer_end_object(w);
+    sa_json_writer_object_field(w, STR_PTR("required"), STR_LEN("required"));
+    sa_json_writer_begin_array(w);
+    sa_json_writer_write_string(w, STR_PTR("patch"), STR_LEN("patch"));
+    sa_json_writer_end_array(w);
+    sa_json_writer_end_object(w);
+    if chat_mode == 1 {
+        sa_json_writer_end_object(w);
+    };
+    sa_json_writer_end_object(w);
+}
+
 // Builds the /v1/responses request JSON. Returns (body_ptr, body_len, json_buf);
 // the caller must keep json_buf alive while using the body, then free it with
 // sa_json_buffer_free.
@@ -297,6 +343,7 @@ fn mini_model_build_request(
     sa_json_writer_end_array(w);
     sa_json_writer_end_object(w);
     sa_json_writer_end_object(w);
+    mini_model_write_apply_patch_tool(w, 0);
     if mcp_len > 0 {
         mini_model_write_mcp_tools(w, mcp_ptr, mcp_len, 0);
     };
@@ -415,6 +462,7 @@ fn mini_model_build_request_chat(
     sa_json_writer_end_object(w);
     sa_json_writer_end_object(w);
     sa_json_writer_end_object(w);
+    mini_model_write_apply_patch_tool(w, 1);
     if mcp_len > 0 {
         mini_model_write_mcp_tools(w, mcp_ptr, mcp_len, 1);
     };
@@ -669,6 +717,143 @@ fn mini_model_tool_command(args_ptr: ptr, args_len: u64) -> (ptr, u64, bool) {
     return (cptr, clen, true);
 }
 
+// apply_patch tool glue: parses {patch, preview?, check?} and runs it.
+// Returns (out_ptr, out_len) text for the function_call_output.
+fn mini_apply_patch_tool(args_ptr: ptr, args_len: u64) -> (ptr, u64) {
+    let root = JSON_PARSE(args_ptr, args_len);
+    if root == PTR_NULL() {
+        return (STR_PTR("(apply_patch: invalid JSON arguments)"), STR_LEN("(apply_patch: invalid JSON arguments)"));
+    };
+    let pkey = STR_PTR("patch");
+    let pkey_len = STR_LEN("patch");
+    if X_OBJ_HAS(root, pkey, pkey_len) != true {
+        return (STR_PTR("(apply_patch: missing required 'patch' argument)"), STR_LEN("(apply_patch: missing required 'patch' argument)"));
+    };
+    let patch_ptr = X_OBJ_STR_PTR(root, pkey, pkey_len);
+    let patch_len = X_OBJ_STR_LEN(root, pkey, pkey_len);
+    var preview: bool;
+    preview = false;
+    let pvkey = STR_PTR("preview");
+    let pvkey_len = STR_LEN("preview");
+    if X_OBJ_HAS(root, pvkey, pvkey_len) == true {
+        let pvslot: u64 = 0;
+        if sa_json_object_get_bool(root, pvkey, pvkey_len, &pvslot) == 0 {
+            preview = pvslot != 0;
+        };
+    };
+    var docheck: bool;
+    docheck = false;
+    let ckkey = STR_PTR("check");
+    let ckkey_len = STR_LEN("check");
+    if X_OBJ_HAS(root, ckkey, ckkey_len) == true {
+        let ckslot: u64 = 0;
+        if sa_json_object_get_bool(root, ckkey, ckkey_len, &ckslot) == 0 {
+            docheck = ckslot != 0;
+        };
+    };
+    if preview == true {
+        let pv = ap_preview_patch(patch_ptr, patch_len);
+        if pv.ok != true {
+            let b = ap_buf_new(256);
+            let b2 = ap_buf_str(b, STR_PTR("apply_patch preview failed: "), STR_LEN("apply_patch preview failed: "));
+            let b3 = ap_buf_str(b2, pv.err_ptr, pv.err_len);
+            return (b3.ptr, b3.len);
+        };
+        return (pv.diff_ptr, pv.diff_len);
+    };
+    let r = ap_apply_patch(patch_ptr, patch_len);
+    if r.ok != true {
+        let b = ap_buf_new(256);
+        let b2 = ap_buf_str(b, STR_PTR("apply_patch failed: "), STR_LEN("apply_patch failed: "));
+        let b3 = ap_buf_str(b2, r.err_ptr, r.err_len);
+        return (b3.ptr, b3.len);
+    };
+    let mut sb = ap_buf_new(256);
+    sb = ap_buf_str(sb, STR_PTR("apply_patch: applied "), STR_LEN("apply_patch: applied "));
+    sb = ap_buf_u64(sb, r.files_changed);
+    sb = ap_buf_str(sb, STR_PTR(" file(s): "), STR_LEN(" file(s): "));
+    var ci: u64;
+    ci = 0;
+    while ci < r.changed.len() {
+        let pl = r.changed[ci];
+        if ci > 0 {
+            sb = ap_buf_str(sb, STR_PTR(", "), STR_LEN(", "));
+        };
+        sb = ap_buf_str(sb, pl.show_ptr, pl.show_len);
+        ci = ci + 1;
+    }
+    // Optional `sa sla check` on changed .sla files.
+    if docheck == true {
+        var ck: u64;
+        ck = 0;
+        while ck < r.changed.len() {
+            let pl2 = r.changed[ck];
+            if pl2.kind == 0 && mini_apply_patch_is_sla(pl2.show_ptr, pl2.show_len) == true {
+                let (ok2, msgp, msgl) = mini_apply_patch_sla_check(pl2.show_ptr, pl2.show_len);
+                sb = ap_buf_str(sb, STR_PTR("\ncheck "), STR_LEN("\ncheck "));
+                sb = ap_buf_str(sb, pl2.show_ptr, pl2.show_len);
+                if ok2 == true {
+                    sb = ap_buf_str(sb, STR_PTR(": ok"), STR_LEN(": ok"));
+                } else {
+                    sb = ap_buf_str(sb, STR_PTR(": FAILED: "), STR_LEN(": FAILED: "));
+                    sb = ap_buf_str(sb, msgp, msgl);
+                };
+            };
+            ck = ck + 1;
+        }
+    };
+    return (sb.ptr, sb.len);
+}
+
+// True when the path ends in ".sla".
+fn mini_apply_patch_is_sla(p: ptr, n: u64) -> bool {
+    if n < 4 {
+        return false;
+    };
+    return ap_byte(p, n - 4) == 46 && ap_byte(p, n - 3) == 115 && ap_byte(p, n - 2) == 108 && ap_byte(p, n - 1) == 97;
+}
+
+// Run `sa sla check <path>` via sh; returns (ok, msg_ptr, msg_len).
+// Skips (ok=true) when `sa` is not on PATH.
+fn mini_apply_patch_sla_check(p: ptr, n: u64) -> (bool, ptr, u64) {
+    // Refuse paths containing a single quote (no shell escaping).
+    var i: u64;
+    i = 0;
+    while i < n {
+        if ap_byte(p, i) == 39 {
+            return (false, STR_PTR("path contains a quote; skipped"), STR_LEN("path contains a quote; skipped"));
+        };
+        i = i + 1;
+    }
+    let mut cb = ap_buf_new(64);
+    cb = ap_buf_str(cb, STR_PTR("command -v sa >/dev/null 2>&1 && sa sla check '"), STR_LEN("command -v sa >/dev/null 2>&1 && sa sla check '"));
+    cb = ap_buf_push(cb, p, n);
+    cb = ap_buf_str(cb, STR_PTR("' 2>&1"), STR_LEN("' 2>&1"));
+    // NUL-terminate for sh -c.
+    cb = ap_buf_byte(cb, 0);
+    let exec = mini_shell_exec(cb.ptr, cb.len - 1);
+    if exec.ok != true {
+        return (false, STR_PTR("could not run sa"), STR_LEN("could not run sa"));
+    };
+    // exec.ok only means the command ran; check output for success marker.
+    // `sa sla check` prints "Successfully ..." on success.
+    let okmark = STR_PTR("Successfully");
+    let okmarkl = STR_LEN("Successfully");
+    var found: bool;
+    found = false;
+    var k: u64;
+    k = 0;
+    while k + okmarkl <= exec.out_len {
+        if ap_eq(X_PTR_ADD(exec.out_ptr, k), okmarkl, okmark, okmarkl) == true {
+            found = true;
+        };
+        k = k + 1;
+    }
+    if found == true {
+        return (true, PTR_NULL(), 0);
+    };
+    return (false, exec.out_ptr, exec.out_len);
+}
 // Single-turn agent loop: prompt -> model -> (tool calls -> exec -> model)* -> done.
 // Mirrors the Rust codex-min single-turn behavior.
 fn mini_model_run_conversation(
@@ -783,7 +968,11 @@ fn mini_model_run_conversation(
                     // 2. Execute the tool.
                     let out_ptr: ptr = PTR_NULL();
                     let out_len: u64 = 0;
-                    if mini_model_str_eq(call.name_ptr, call.name_len, STR_PTR("shell_exec"), STR_LEN("shell_exec")) {
+                    if mini_model_str_eq(call.name_ptr, call.name_len, STR_PTR("apply_patch"), STR_LEN("apply_patch")) {
+                        let (ap_out_ptr, ap_out_len) = mini_apply_patch_tool(call.args_ptr, call.args_len);
+                        out_ptr = ap_out_ptr;
+                        out_len = ap_out_len;
+                    } else if mini_model_str_eq(call.name_ptr, call.name_len, STR_PTR("shell_exec"), STR_LEN("shell_exec")) {
                         let (cmd_ptr, cmd_len, cmd_ok) = mini_model_tool_command(call.args_ptr, call.args_len);
                         if cmd_ok == true {
                             let exec = mini_shell_exec(cmd_ptr, cmd_len);

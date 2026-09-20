@@ -1,0 +1,1376 @@
+// applypatch.sla — pure-SLA apply_patch: parse + apply codex-format patches.
+//
+// Mirrors the semantics of openai/codex `apply-patch` crate
+// (parser.rs / seek_sequence.rs / file_update.rs):
+//   *** Begin Patch / *** End Patch
+//   *** Add File: <path>      (following +lines are the new contents)
+//   *** Delete File: <path>
+//   *** Update File: <path>   (optional *** Move to: <new> first)
+//   @@ [context]              (starts a chunk; first chunk may omit @@)
+//    <ctx> / -<del> / +<add>  (empty line = empty context line)
+//   *** End of File           (chunk must match at end of file)
+//
+// Matching fuzz levels (seek_sequence): exact -> trailing-ws-insensitive ->
+// fully-ws-insensitive. Documented deviation: codex's 4th pass (unicode
+// punctuation normalization) is NOT implemented.
+//
+// Atomicity: the whole patch is parsed and every file op is validated +
+// computed before ANY file is written. A failed hunk leaves all files
+// untouched. Errors always carry the patch line number and a reason.
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/vec.sa"
+@import "sa_std/fs.sa"
+@import "sa_std/io/print.sai"
+@import "slicex.sa"
+@import "sessionx.sa"
+@import "sa_std/core/slice.sa"
+
+// File op kinds.
+const AP_OP_ADD: u64 = 0;
+const AP_OP_UPDATE: u64 = 1;
+const AP_OP_DELETE: u64 = 2;
+
+// One source line: a slice of the input buffer (no trailing newline).
+struct ApLine {
+    ptr: ptr,
+    len: u64,
+}
+
+// One @@ chunk of an Update File hunk.
+struct ApChunk {
+    has_ctx: bool,
+    ctx_ptr: ptr,
+    ctx_len: u64,
+    old_lines: Vec<ApLine>,
+    new_lines: Vec<ApLine>,
+    is_eof: bool,
+}
+
+struct ApFileOp {
+    kind: u64,
+    path_ptr: ptr,
+    path_len: u64,
+    marker_line: u64,
+    has_move: bool,
+    move_ptr: ptr,
+    move_len: u64,
+    chunks: Vec<ApChunk>,
+    add_ptr: ptr,
+    add_len: u64,
+}
+
+// Growable byte buffer (heap; intentionally never freed — short-lived CLI).
+struct ApBuf {
+    ptr: ptr,
+    len: u64,
+    cap: u64,
+}
+
+struct ApReplacement {
+    start: u64,
+    old_len: u64,
+    new_lines: Vec<ApLine>,
+}
+
+struct ApPlanned {
+    kind: u64,        // 0 = write, 1 = remove
+    path_ptr: ptr,
+    path_len: u64,
+    data_ptr: ptr,
+    data_len: u64,    // write payload
+    del_ptr: ptr,
+    del_len: u64,     // move: delete old path after writing new one
+    has_del: bool,
+    show_ptr: ptr,    // path reported to the caller (dst for moves)
+    show_len: u64,
+    orig_ptr: ptr,    // original content for rollback (had_orig=true)
+    orig_len: u64,
+    had_orig: bool,   // false for Add (file did not exist)
+}
+
+struct ApApplyResult {
+    ok: bool,
+    err_ptr: ptr,
+    err_len: u64,
+    files_changed: u64,
+    changed: Vec<ApPlanned>,
+}
+
+// ---- byte helpers ----
+
+fn ap_byte(p: ptr, i: u64) -> u64 {
+    let q = X_PTR_ADD(p, i);
+    return X_LOAD_U8(q);
+}
+
+fn ap_is_ws(b: u64) -> bool {
+    return b == 32 || b == 9 || b == 13;
+}
+
+// ap_trim: strip leading/trailing ASCII ws (space, tab, CR).
+fn ap_trim(p: ptr, n: u64) -> (ptr, u64) {
+    var s: u64;
+    s = 0;
+    while s < n {
+        if ap_is_ws(ap_byte(p, s)) != true {
+            break;
+        };
+        s = s + 1;
+    }
+    var e: u64;
+    e = n;
+    while e > s {
+        if ap_is_ws(ap_byte(p, e - 1)) != true {
+            break;
+        };
+        e = e - 1;
+    }
+    return (X_PTR_ADD(p, s), e - s);
+}
+
+fn ap_trim_end(p: ptr, n: u64) -> (ptr, u64) {
+    var e: u64;
+    e = n;
+    while e > 0 {
+        if ap_is_ws(ap_byte(p, e - 1)) != true {
+            break;
+        };
+        e = e - 1;
+    }
+    return (p, e);
+}
+
+fn ap_starts_with(p: ptr, n: u64, q: ptr, m: u64) -> bool {
+    if n < m {
+        return false;
+    };
+    var i: u64;
+    i = 0;
+    while i < m {
+        if ap_byte(p, i) != ap_byte(q, i) {
+            return false;
+        };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn ap_eq(p: ptr, n: u64, q: ptr, m: u64) -> bool {
+    return X_STR_EQ(p, n, q, m);
+}
+
+// line equality under fuzz mode: 0=exact, 1=trim_end, 2=trim.
+fn ap_line_eq(a_ptr: ptr, a_len: u64, b_ptr: ptr, b_len: u64, mode: u64) -> bool {
+    if mode == 0 {
+        return ap_eq(a_ptr, a_len, b_ptr, b_len);
+    };
+    if mode == 1 {
+        let (x_ptr, x_len) = ap_trim_end(a_ptr, a_len);
+        let (y_ptr, y_len) = ap_trim_end(b_ptr, b_len);
+        return ap_eq(x_ptr, x_len, y_ptr, y_len);
+    };
+    let (x_ptr, x_len) = ap_trim(a_ptr, a_len);
+    let (y_ptr, y_len) = ap_trim(b_ptr, b_len);
+    return ap_eq(x_ptr, x_len, y_ptr, y_len);
+}
+
+// ---- growable buffer ----
+
+fn ap_buf_new(cap: u64) -> ApBuf {
+    var c: u64;
+    c = cap;
+    if c < 64 {
+        c = 64;
+    };
+    return ApBuf { ptr: X_HEAP_BUF_PTR(c), len: 0, cap: c };
+}
+
+fn ap_buf_reserve(b: ApBuf, extra: u64) -> ApBuf {
+    if b.len + extra <= b.cap {
+        return b;
+    };
+    var ncap: u64;
+    ncap = b.cap * 2;
+    let need = b.len + extra;
+    if ncap < need {
+        ncap = need;
+    };
+    let np = X_HEAP_BUF_PTR(ncap);
+    X_COPY_BYTES(np, b.ptr, b.len);
+    let mut nb = b;
+    nb.ptr = np;
+    nb.cap = ncap;
+    return nb;
+}
+
+fn ap_buf_push(b: ApBuf, p: ptr, n: u64) -> ApBuf {
+    let mut nb = ap_buf_reserve(b, n);
+    X_COPY_BYTES(X_PTR_ADD(nb.ptr, nb.len), p, n);
+    nb.len = nb.len + n;
+    return nb;
+}
+
+fn ap_buf_byte(b: ApBuf, v: u64) -> ApBuf {
+    let mut nb = ap_buf_reserve(b, 1);
+    X_STORE_U8(X_PTR_ADD(nb.ptr, nb.len), v);
+    nb.len = nb.len + 1;
+    return nb;
+}
+
+fn ap_buf_u64(b: ApBuf, v: u64) -> ApBuf {
+    let mut nb = b;
+    if v == 0 {
+        return ap_buf_byte(nb, 48);
+    };
+    var tmp: u64;
+    tmp = v;
+    var nd: u64;
+    nd = 0;
+    while tmp > 0 {
+        nd = nd + 1;
+        tmp = tmp / 10;
+    }
+    nb = ap_buf_reserve(nb, nd);
+    var i: u64;
+    i = nd;
+    tmp = v;
+    while tmp > 0 {
+        i = i - 1;
+        X_STORE_U8(X_PTR_ADD(nb.ptr, nb.len + i), 48 + (tmp % 10));
+        tmp = tmp / 10;
+    }
+    nb.len = nb.len + nd;
+    return nb;
+}
+
+fn ap_buf_str(b: ApBuf, s_ptr: ptr, s_len: u64) -> ApBuf {
+    return ap_buf_push(b, s_ptr, s_len);
+}
+
+// ---- line splitting ----
+
+fn ap_split_lines(p: ptr, n: u64) -> Vec<ApLine> {
+    let out: Vec<ApLine> = Vec::new();
+    var s: u64;
+    s = 0;
+    var i: u64;
+    i = 0;
+    while i < n {
+        if ap_byte(p, i) == 10 {
+            var e: u64;
+            e = i;
+            if e > s {
+                if ap_byte(p, e - 1) == 13 {
+                    e = e - 1;
+                };
+            };
+            out.push(ApLine { ptr: X_PTR_ADD(p, s), len: e - s });
+            s = i + 1;
+        };
+        i = i + 1;
+    }
+    if s < n {
+        var e2: u64;
+        e2 = n;
+        if ap_byte(p, e2 - 1) == 13 {
+            e2 = e2 - 1;
+        };
+        out.push(ApLine { ptr: X_PTR_ADD(p, s), len: e2 - s });
+    };
+    return out;
+}
+
+// ---- marker matching ----
+
+fn ap_is_marker_line(p: ptr, n: u64) -> bool {
+    if n < 3 {
+        return false;
+    };
+    return ap_byte(p, 0) == 42 && ap_byte(p, 1) == 42 && ap_byte(p, 2) == 42;
+}
+
+// If trimmed line starts with `marker`, returns (rest_ptr, rest_len, true)
+// where rest is trimmed.
+fn ap_marker_arg(p: ptr, n: u64, m_ptr: ptr, m_len: u64) -> (ptr, u64, bool) {
+    if ap_starts_with(p, n, m_ptr, m_len) != true {
+        return (PTR_NULL(), 0, false);
+    };
+    let rp = X_PTR_ADD(p, m_len);
+    let rn = n - m_len;
+    let (tp, tn) = ap_trim(rp, rn);
+    return (tp, tn, true);
+}
+
+// ---- parser ----
+
+struct ApParser {
+    ops: Vec<ApFileOp>,
+    cur: ApFileOp,
+    have_cur: bool,
+    chunk: ApChunk,
+    have_chunk: bool,
+    saw_eof: bool,
+    add_buf: ApBuf,
+    ok: bool,
+    err_ptr: ptr,
+    err_len: u64,
+    err_line: u64,
+}
+
+fn ap_fresh_chunk() -> ApChunk {
+    return ApChunk {
+        has_ctx: false,
+        ctx_ptr: PTR_NULL(),
+        ctx_len: 0,
+        old_lines: Vec::new(),
+        new_lines: Vec::new(),
+        is_eof: false,
+    };
+}
+
+fn ap_fresh_op() -> ApFileOp {
+    return ApFileOp {
+        kind: 99,
+        path_ptr: PTR_NULL(),
+        path_len: 0,
+        marker_line: 0,
+        has_move: false,
+        move_ptr: PTR_NULL(),
+        move_len: 0,
+        chunks: Vec::new(),
+        add_ptr: PTR_NULL(),
+        add_len: 0,
+    };
+}
+
+fn ap_parser_new() -> ApParser {
+    return ApParser {
+        ops: Vec::new(),
+        cur: ap_fresh_op(),
+        have_cur: false,
+        chunk: ap_fresh_chunk(),
+        have_chunk: false,
+        saw_eof: false,
+        add_buf: ap_buf_new(256),
+        ok: true,
+        err_ptr: PTR_NULL(),
+        err_len: 0,
+        err_line: 0,
+    };
+}
+
+fn ap_fail(p: ApParser, msg_ptr: ptr, msg_len: u64, line: u64) -> ApParser {
+    let mut np = p;
+    np.ok = false;
+    np.err_ptr = msg_ptr;
+    np.err_len = msg_len;
+    np.err_line = line;
+    return np;
+}
+
+fn ap_fail_msg(p: ApParser, b: ApBuf, line: u64) -> ApParser {
+    return ap_fail(p, b.ptr, b.len, line);
+}
+
+// Flush pending chunk into current op.
+fn ap_flush_chunk(p: ApParser) -> ApParser {
+    let mut np = p;
+    if np.have_chunk == true {
+        np.cur.chunks.push(np.chunk);
+        np.chunk = ap_fresh_chunk();
+        np.have_chunk = false;
+        np.saw_eof = false;
+    };
+    return np;
+}
+
+fn ap_chunk_has_lines(ch: ApChunk) -> bool {
+    return ch.old_lines.len() > 0 || ch.new_lines.len() > 0;
+}
+
+// Flush pending op into ops (validates non-empty update hunks / add contents).
+// trig_* describes the line that triggered the flush (for error messages);
+// is_end marks '*** End Patch' (codex uses a different message there).
+fn ap_flush_op(p: ApParser, trig_ptr: ptr, trig_len: u64, is_end: bool, trig_line: u64) -> ApParser {
+    let mut np = ap_flush_chunk(p);
+    if np.have_cur == true {
+        if np.cur.kind == AP_OP_UPDATE {
+            let nch = np.cur.chunks.len();
+            if nch == 0 {
+                let mut_b = ap_buf_new(128);
+                let mut_b2 = ap_buf_str(mut_b, STR_PTR("Update file hunk for path '"), STR_LEN("Update file hunk for path '"));
+                let mut_b3 = ap_buf_str(mut_b2, np.cur.path_ptr, np.cur.path_len);
+                let b = ap_buf_str(mut_b3, STR_PTR("' is empty"), STR_LEN("' is empty"));
+                return ap_fail_msg(np, b, np.cur.marker_line);
+            };
+            let last = np.cur.chunks[nch - 1];
+            if ap_chunk_has_lines(last) != true {
+                if is_end == true {
+                    let b = ap_buf_str(ap_buf_new(96), STR_PTR("Update hunk does not contain any lines"), STR_LEN("Update hunk does not contain any lines"));
+                    return ap_fail_msg(np, b, trig_line);
+                };
+                let mut_c = ap_buf_new(192);
+                let mut_c2 = ap_buf_str(mut_c, STR_PTR("Unexpected line found in update hunk: '"), STR_LEN("Unexpected line found in update hunk: '"));
+                let mut_c3 = ap_buf_str(mut_c2, trig_ptr, trig_len);
+                let b = ap_buf_str(mut_c3, STR_PTR("'. Every line should start with ' ' (context line), '+' (added line), or '-' (removed line)"), STR_LEN("'. Every line should start with ' ' (context line), '+' (added line), or '-' (removed line)"));
+                return ap_fail_msg(np, b, trig_line);
+            };
+        };
+        if np.cur.kind == AP_OP_ADD {
+            if np.add_buf.len == 0 {
+                let mut_b = ap_buf_new(128);
+                let mut_b2 = ap_buf_str(mut_b, STR_PTR("Add file hunk for path '"), STR_LEN("Add file hunk for path '"));
+                let mut_b3 = ap_buf_str(mut_b2, np.cur.path_ptr, np.cur.path_len);
+                let b = ap_buf_str(mut_b3, STR_PTR("' has no content lines (expected '+' lines)"), STR_LEN("' has no content lines (expected '+' lines)"));
+                return ap_fail_msg(np, b, np.cur.marker_line);
+            };
+            np.cur.add_ptr = np.add_buf.ptr;
+            np.cur.add_len = np.add_buf.len;
+        };
+        np.ops.push(np.cur);
+        np.cur = ap_fresh_op();
+        np.have_cur = false;
+        np.add_buf = ap_buf_new(256);
+    };
+    return np;
+}
+
+struct ApParseOut {
+    ok: bool,
+    err_ptr: ptr,
+    err_len: u64,
+    err_line: u64,
+    ops: Vec<ApFileOp>,
+}
+
+fn ap_parse(patch_ptr: ptr, patch_len: u64) -> ApParseOut {
+    let lines = ap_split_lines(patch_ptr, patch_len);
+    let n = lines.len();
+    let mut p = ap_parser_new();
+    // 1. Find *** Begin Patch (skip leading blank / heredoc wrapper lines).
+    var i: u64;
+    i = 0;
+    var started: bool;
+    started = false;
+    while i < n {
+        let l = lines[i];
+        let (tp, tn) = ap_trim(l.ptr, l.len);
+        if tn > 0 {
+            if ap_is_marker_line(tp, tn) == true {
+                if ap_eq(tp, tn, STR_PTR("*** Begin Patch"), STR_LEN("*** Begin Patch")) == true {
+                    started = true;
+                    i = i + 1;
+                    break;
+                };
+                let b = ap_buf_str(ap_buf_new(96), STR_PTR("first '***' marker must be '*** Begin Patch'"), STR_LEN("first '***' marker must be '*** Begin Patch'"));
+                p = ap_fail_msg(p, b, i + 1);
+                return ApParseOut { ok: false, err_ptr: p.err_ptr, err_len: p.err_len, err_line: p.err_line, ops: p.ops };
+            };
+        };
+        i = i + 1;
+    }
+    if started != true {
+        let b = ap_buf_str(ap_buf_new(64), STR_PTR("missing '*** Begin Patch'"), STR_LEN("missing '*** Begin Patch'"));
+        p = ap_fail_msg(p, b, 1);
+        return ApParseOut { ok: false, err_ptr: p.err_ptr, err_len: p.err_len, err_line: p.err_line, ops: p.ops };
+    };
+    // 2. Main loop.
+    while i < n {
+        let l = lines[i];
+        let lineno = i + 1;
+        let (tp, tn) = ap_trim(l.ptr, l.len);
+        if l.len == 0 {
+            // Truly empty line: inside an update hunk it is an empty context
+            // line (codex compat); after '*** End of File' it is ignored.
+            if p.have_cur == true && p.cur.kind == AP_OP_UPDATE {
+                if p.saw_eof == true {
+                    i = i + 1;
+                    continue;
+                };
+                if p.have_chunk != true {
+                    p.chunk = ap_fresh_chunk();
+                    p.have_chunk = true;
+                };
+                p.chunk.old_lines.push(ApLine { ptr: tp, len: 0 });
+                p.chunk.new_lines.push(ApLine { ptr: tp, len: 0 });
+                i = i + 1;
+                continue;
+            };
+            // Lenient (codex rejects blank lines outside update hunks; we skip).
+            i = i + 1;
+            continue;
+        };
+        if ap_is_marker_line(tp, tn) == true {
+            // --- file markers ---
+            let (argp, argn, is_add) = ap_marker_arg(tp, tn, STR_PTR("*** Add File: "), STR_LEN("*** Add File: "));
+            if is_add == true {
+                if argn == 0 {
+                    let b = ap_buf_str(ap_buf_new(64), STR_PTR("'*** Add File:' missing path"), STR_LEN("'*** Add File:' missing path"));
+                    p = ap_fail_msg(p, b, lineno);
+                    return ApParseOut { ok: false, err_ptr: p.err_ptr, err_len: p.err_len, err_line: p.err_line, ops: p.ops };
+                };
+                p = ap_flush_op(p, tp, tn, false, lineno);
+                if p.ok != true {
+                    return ApParseOut { ok: false, err_ptr: p.err_ptr, err_len: p.err_len, err_line: p.err_line, ops: p.ops };
+                };
+                p.have_cur = true;
+                p.cur.kind = AP_OP_ADD;
+                p.cur.path_ptr = argp;
+                p.cur.path_len = argn;
+                p.cur.marker_line = lineno;
+                i = i + 1;
+                continue;
+            };
+            let (dargp, dargn, is_del) = ap_marker_arg(tp, tn, STR_PTR("*** Delete File: "), STR_LEN("*** Delete File: "));
+            if is_del == true {
+                if dargn == 0 {
+                    let b = ap_buf_str(ap_buf_new(64), STR_PTR("'*** Delete File:' missing path"), STR_LEN("'*** Delete File:' missing path"));
+                    p = ap_fail_msg(p, b, lineno);
+                    return ApParseOut { ok: false, err_ptr: p.err_ptr, err_len: p.err_len, err_line: p.err_line, ops: p.ops };
+                };
+                p = ap_flush_op(p, tp, tn, false, lineno);
+                if p.ok != true {
+                    return ApParseOut { ok: false, err_ptr: p.err_ptr, err_len: p.err_len, err_line: p.err_line, ops: p.ops };
+                };
+                p.have_cur = true;
+                p.cur.kind = AP_OP_DELETE;
+                p.cur.path_ptr = dargp;
+                p.cur.path_len = dargn;
+                p.cur.marker_line = lineno;
+                i = i + 1;
+                continue;
+            };
+            let (uargp, uargn, is_upd) = ap_marker_arg(tp, tn, STR_PTR("*** Update File: "), STR_LEN("*** Update File: "));
+            if is_upd == true {
+                if uargn == 0 {
+                    let b = ap_buf_str(ap_buf_new(64), STR_PTR("'*** Update File:' missing path"), STR_LEN("'*** Update File:' missing path"));
+                    p = ap_fail_msg(p, b, lineno);
+                    return ApParseOut { ok: false, err_ptr: p.err_ptr, err_len: p.err_len, err_line: p.err_line, ops: p.ops };
+                };
+                p = ap_flush_op(p, tp, tn, false, lineno);
+                if p.ok != true {
+                    return ApParseOut { ok: false, err_ptr: p.err_ptr, err_len: p.err_len, err_line: p.err_line, ops: p.ops };
+                };
+                p.have_cur = true;
+                p.cur.kind = AP_OP_UPDATE;
+                p.cur.path_ptr = uargp;
+                p.cur.path_len = uargn;
+                p.cur.marker_line = lineno;
+                i = i + 1;
+                continue;
+            };
+            let (margp, margn, is_mov) = ap_marker_arg(tp, tn, STR_PTR("*** Move to: "), STR_LEN("*** Move to: "));
+            if is_mov == true {
+                if p.have_cur != true || p.cur.kind != AP_OP_UPDATE || p.have_chunk == true || p.cur.chunks.len() > 0 {
+                    let b = ap_buf_str(ap_buf_new(96), STR_PTR("'*** Move to:' must directly follow '*** Update File:'"), STR_LEN("'*** Move to:' must directly follow '*** Update File:'"));
+                    p = ap_fail_msg(p, b, lineno);
+                    return ApParseOut { ok: false, err_ptr: p.err_ptr, err_len: p.err_len, err_line: p.err_line, ops: p.ops };
+                };
+                if margn == 0 {
+                    let b = ap_buf_str(ap_buf_new(64), STR_PTR("'*** Move to:' missing path"), STR_LEN("'*** Move to:' missing path"));
+                    p = ap_fail_msg(p, b, lineno);
+                    return ApParseOut { ok: false, err_ptr: p.err_ptr, err_len: p.err_len, err_line: p.err_line, ops: p.ops };
+                };
+                p.cur.has_move = true;
+                p.cur.move_ptr = margp;
+                p.cur.move_len = margn;
+                i = i + 1;
+                continue;
+            };
+            if ap_eq(tp, tn, STR_PTR("*** End of File"), STR_LEN("*** End of File")) == true {
+                if p.have_cur != true || p.cur.kind != AP_OP_UPDATE || p.have_chunk != true {
+                    let b = ap_buf_str(ap_buf_new(96), STR_PTR("'*** End of File' outside an update chunk"), STR_LEN("'*** End of File' outside an update chunk"));
+                    p = ap_fail_msg(p, b, lineno);
+                    return ApParseOut { ok: false, err_ptr: p.err_ptr, err_len: p.err_len, err_line: p.err_line, ops: p.ops };
+                };
+                if ap_chunk_has_lines(p.chunk) != true {
+                    let b = ap_buf_str(ap_buf_new(96), STR_PTR("Update hunk does not contain any lines"), STR_LEN("Update hunk does not contain any lines"));
+                    p = ap_fail_msg(p, b, lineno);
+                    return ApParseOut { ok: false, err_ptr: p.err_ptr, err_len: p.err_len, err_line: p.err_line, ops: p.ops };
+                };
+                p.chunk.is_eof = true;
+                p.saw_eof = true;
+                i = i + 1;
+                continue;
+            };
+            if ap_eq(tp, tn, STR_PTR("*** End Patch"), STR_LEN("*** End Patch")) == true {
+                p = ap_flush_op(p, tp, tn, true, lineno);
+                // Trailing blank lines after End Patch are fine; anything else errors.
+                var j: u64;
+                j = i + 1;
+                while j < n {
+                    let lj = lines[j];
+                    let (tjp, tjn) = ap_trim(lj.ptr, lj.len);
+                    if tjn > 0 {
+                        let b = ap_buf_str(ap_buf_new(96), STR_PTR("content after '*** End Patch'"), STR_LEN("content after '*** End Patch'"));
+                        p = ap_fail_msg(p, b, j + 1);
+                        return ApParseOut { ok: false, err_ptr: p.err_ptr, err_len: p.err_len, err_line: p.err_line, ops: p.ops };
+                    };
+                    j = j + 1;
+                }
+                if p.ok != true {
+                    return ApParseOut { ok: false, err_ptr: p.err_ptr, err_len: p.err_len, err_line: p.err_line, ops: p.ops };
+                };
+                if p.ops.len() == 0 {
+                    let eb = ap_buf_str(ap_buf_new(96), STR_PTR("patch contains no file operations"), STR_LEN("patch contains no file operations"));
+                    p = ap_fail_msg(p, eb, lineno);
+                    return ApParseOut { ok: false, err_ptr: p.err_ptr, err_len: p.err_len, err_line: p.err_line, ops: p.ops };
+                };
+                return ApParseOut { ok: true, err_ptr: PTR_NULL(), err_len: 0, err_line: 0, ops: p.ops };
+            };
+            let (eargp, eargn, is_env) = ap_marker_arg(tp, tn, STR_PTR("*** Environment ID: "), STR_LEN("*** Environment ID: "));
+            if is_env == true {
+                // Accepted and ignored (codex compat).
+                i = i + 1;
+                continue;
+            };
+            let b = ap_buf_new(128);
+            let b2 = ap_buf_str(b, STR_PTR("unknown patch marker: '"), STR_LEN("unknown patch marker: '"));
+            let b3 = ap_buf_str(b2, tp, tn);
+            let b4 = ap_buf_str(b3, STR_PTR("'"), STR_LEN("'"));
+            p = ap_fail_msg(p, b4, lineno);
+            return ApParseOut { ok: false, err_ptr: p.err_ptr, err_len: p.err_len, err_line: p.err_line, ops: p.ops };
+        };
+        // --- non-marker line: must belong to a file op ---
+        if p.have_cur != true {
+            let b = ap_buf_str(ap_buf_new(96), STR_PTR("patch line outside any file hunk"), STR_LEN("patch line outside any file hunk"));
+            p = ap_fail_msg(p, b, lineno);
+            return ApParseOut { ok: false, err_ptr: p.err_ptr, err_len: p.err_len, err_line: p.err_line, ops: p.ops };
+        };
+        if p.cur.kind == AP_OP_ADD {
+            // Add lines must start with '+'.
+            if l.len == 0 || ap_byte(l.ptr, 0) != 43 {
+                let b = ap_buf_str(ap_buf_new(96), STR_PTR("Add File hunk: expected '+' line"), STR_LEN("Add File hunk: expected '+' line"));
+                p = ap_fail_msg(p, b, lineno);
+                return ApParseOut { ok: false, err_ptr: p.err_ptr, err_len: p.err_len, err_line: p.err_line, ops: p.ops };
+            };
+            let cp = X_PTR_ADD(l.ptr, 1);
+            let cn = l.len - 1;
+            p.add_buf = ap_buf_push(p.add_buf, cp, cn);
+            p.add_buf = ap_buf_byte(p.add_buf, 10);
+            i = i + 1;
+            continue;
+        };
+        if p.cur.kind == AP_OP_DELETE {
+            let b = ap_buf_str(ap_buf_new(96), STR_PTR("Delete File hunk takes no content lines"), STR_LEN("Delete File hunk takes no content lines"));
+            p = ap_fail_msg(p, b, lineno);
+            return ApParseOut { ok: false, err_ptr: p.err_ptr, err_len: p.err_len, err_line: p.err_line, ops: p.ops };
+        };
+        // Update File: chunk lines.
+        // "@@" chunk header? (matched on trim_end'ed line, codex compat:
+        // exactly "@@" or "@@ " prefix; a leading-space "@@" is a context line.)
+        let (tep, ten) = ap_trim_end(l.ptr, l.len);
+        var is_at: bool;
+        is_at = false;
+        if ten == 2 && ap_byte(tep, 0) == 64 && ap_byte(tep, 1) == 64 {
+            is_at = true;
+        } else if ten > 3 && ap_byte(tep, 0) == 64 && ap_byte(tep, 1) == 64 && ap_byte(tep, 2) == 32 {
+            is_at = true;
+        };
+        if is_at == true {
+            if p.have_chunk == true && ap_chunk_has_lines(p.chunk) != true {
+                let b = ap_buf_new(160);
+                let b2 = ap_buf_str(b, STR_PTR("Unexpected line found in update hunk: '"), STR_LEN("Unexpected line found in update hunk: '"));
+                let b3 = ap_buf_str(b2, tp, tn);
+                let b4 = ap_buf_str(b3, STR_PTR("'. Every line should start with ' ' (context line), '+' (added line), or '-' (removed line)"), STR_LEN("'. Every line should start with ' ' (context line), '+' (added line), or '-' (removed line)"));
+                p = ap_fail_msg(p, b4, lineno);
+                return ApParseOut { ok: false, err_ptr: p.err_ptr, err_len: p.err_len, err_line: p.err_line, ops: p.ops };
+            };
+            p = ap_flush_chunk(p);
+            p.chunk = ap_fresh_chunk();
+            p.have_chunk = true;
+            // Optional context after "@@".
+            let rp = X_PTR_ADD(l.ptr, 2);
+            let rn = l.len - 2;
+            let (cp2, cn2) = ap_trim(rp, rn);
+            if cn2 > 0 {
+                p.chunk.has_ctx = true;
+                p.chunk.ctx_ptr = cp2;
+                p.chunk.ctx_len = cn2;
+            };
+            i = i + 1;
+            continue;
+        };
+        if p.saw_eof == true {
+            let b = ap_buf_new(160);
+            let b2 = ap_buf_str(b, STR_PTR("Expected update hunk to start with a @@ context marker, got: '"), STR_LEN("Expected update hunk to start with a @@ context marker, got: '"));
+            let b3 = ap_buf_str(b2, tp, tn);
+            let b4 = ap_buf_str(b3, STR_PTR("'"), STR_LEN("'"));
+            p = ap_fail_msg(p, b4, lineno);
+            return ApParseOut { ok: false, err_ptr: p.err_ptr, err_len: p.err_len, err_line: p.err_line, ops: p.ops };
+        };
+        if p.have_chunk != true {
+            // First chunk may omit the @@ header (codex compat).
+            p.chunk = ap_fresh_chunk();
+            p.have_chunk = true;
+        };
+        let c0 = ap_byte(l.ptr, 0);
+        if c0 == 32 {
+            // ' ' context
+            let cp = X_PTR_ADD(l.ptr, 1);
+            let cn = l.len - 1;
+            p.chunk.old_lines.push(ApLine { ptr: cp, len: cn });
+            p.chunk.new_lines.push(ApLine { ptr: cp, len: cn });
+        } else if c0 == 43 {
+            // '+' addition
+            let cp = X_PTR_ADD(l.ptr, 1);
+            let cn = l.len - 1;
+            p.chunk.new_lines.push(ApLine { ptr: cp, len: cn });
+        } else if c0 == 45 {
+            // '-' deletion
+            let cp = X_PTR_ADD(l.ptr, 1);
+            let cn = l.len - 1;
+            p.chunk.old_lines.push(ApLine { ptr: cp, len: cn });
+        } else {
+            let b = ap_buf_new(128);
+            let b2 = ap_buf_str(b, STR_PTR("invalid change line prefix (expected ' ', '-', '+' or '@@')"), STR_LEN("invalid change line prefix (expected ' ', '-', '+' or '@@')"));
+            p = ap_fail_msg(p, b2, lineno);
+            return ApParseOut { ok: false, err_ptr: p.err_ptr, err_len: p.err_len, err_line: p.err_line, ops: p.ops };
+        };
+        i = i + 1;
+    }
+    // EOF without *** End Patch.
+    let b = ap_buf_str(ap_buf_new(96), STR_PTR("missing '*** End Patch'"), STR_LEN("missing '*** End Patch'"));
+    p = ap_fail_msg(p, b, n);
+    return ApParseOut { ok: false, err_ptr: p.err_ptr, err_len: p.err_len, err_line: p.err_line, ops: p.ops };
+}
+
+// ---- seek_sequence: find pattern lines in file lines at/after start ----
+// Fuzz levels: 0 = exact, 1 = trailing-ws-insensitive, 2 = fully-ws-insensitive.
+// Returns (index, found).
+
+fn ap_seq_eq_at(lines: Vec<ApLine>, li: u64, pat: Vec<ApLine>, m: u64, mode: u64) -> bool {
+    var k: u64;
+    k = 0;
+    while k < m {
+        let a = lines[li + k];
+        let b = pat[k];
+        if ap_line_eq(a.ptr, a.len, b.ptr, b.len, mode) != true {
+            return false;
+        };
+        k = k + 1;
+    }
+    return true;
+}
+
+fn ap_seek(lines: Vec<ApLine>, pat: Vec<ApLine>, start: u64) -> (u64, bool) {
+    let m = pat.len();
+    let n = lines.len();
+    if m == 0 {
+        return (start, true);
+    };
+    if m > n {
+        return (0, false);
+    };
+    var mode: u64;
+    mode = 0;
+    while mode < 3 {
+        var i: u64;
+        i = start;
+        while i + m <= n {
+            if ap_seq_eq_at(lines, i, pat, m, mode) == true {
+                return (i, true);
+            };
+            i = i + 1;
+        }
+        mode = mode + 1;
+    }
+    return (0, false);
+}
+
+// Anchored end-of-file match attempt (fuzz levels 0..2 at one position).
+fn ap_match_at(lines: Vec<ApLine>, at: u64, pat: Vec<ApLine>) -> bool {
+    let m = pat.len();
+    if at + m > lines.len() {
+        return false;
+    };
+    var mode: u64;
+    mode = 0;
+    while mode < 3 {
+        if ap_seq_eq_at(lines, at, pat, m, mode) == true {
+            return true;
+        };
+        mode = mode + 1;
+    }
+    return false;
+}
+
+// ---- replacement computation for one Update File op ----
+
+struct ApChunkResult {
+    ok: bool,
+    err_ptr: ptr,
+    err_len: u64,
+    reps: Vec<ApReplacement>,
+}
+
+fn ap_hunk_err(path_ptr: ptr, path_len: u64, chunk_no: u64, msg_ptr: ptr, msg_len: u64, near_line: u64) -> ApChunkResult {
+    let b = ap_buf_new(256);
+    let b2 = ap_buf_str(b, STR_PTR("hunk "), STR_LEN("hunk "));
+    let b3 = ap_buf_u64(b2, chunk_no);
+    let b4 = ap_buf_str(b3, STR_PTR(" of '"), STR_LEN(" of '"));
+    let b5 = ap_buf_str(b4, path_ptr, path_len);
+    let b6 = ap_buf_str(b5, STR_PTR("': "), STR_LEN("': "));
+    let b7 = ap_buf_str(b6, msg_ptr, msg_len);
+    let b8 = ap_buf_str(b7, STR_PTR(" (near file line "), STR_LEN(" (near file line "));
+    let b9 = ap_buf_u64(b8, near_line);
+    let b10 = ap_buf_str(b9, STR_PTR(")"), STR_LEN(")"));
+    let er1: Vec<ApReplacement> = Vec::new();
+    return ApChunkResult { ok: false, err_ptr: b10.ptr, err_len: b10.len, reps: er1 };
+}
+
+fn ap_compute_reps(op: ApFileOp, orig: Vec<ApLine>) -> ApChunkResult {
+    let reps: Vec<ApReplacement> = Vec::new();
+    var cursor: u64;
+    cursor = 0;
+    var prev_end: u64;
+    prev_end = 0;
+    var ci: u64;
+    ci = 0;
+    let nchunks = op.chunks.len();
+    while ci < nchunks {
+        let ch = op.chunks[ci];
+        let chunk_no = ci + 1;
+        // 1. Optional change_context narrows the search position.
+        if ch.has_ctx == true {
+            let ctx_pat: Vec<ApLine> = Vec::new();
+            ctx_pat.push(ApLine { ptr: ch.ctx_ptr, len: ch.ctx_len });
+            let (cidx, cfound) = ap_seek(orig, ctx_pat, cursor);
+            if cfound != true {
+                let r = ap_hunk_err(op.path_ptr, op.path_len, chunk_no,
+                    STR_PTR("context not found"), STR_LEN("context not found"), cursor + 1);
+                // include the context text
+                let b = ap_buf_new(128);
+                let b2 = ap_buf_str(b, STR_PTR("failed to find context '"), STR_LEN("failed to find context '"));
+                let b3 = ap_buf_str(b2, ch.ctx_ptr, ch.ctx_len);
+                let b4 = ap_buf_str(b3, STR_PTR("'"), STR_LEN("'"));
+                let er2: Vec<ApReplacement> = Vec::new();
+                return ApChunkResult { ok: false, err_ptr: b4.ptr, err_len: b4.len, reps: er2 };
+            };
+            cursor = cidx + 1;
+        };
+        let m = ch.old_lines.len();
+        var rstart: u64;
+        rstart = 0;
+        if m == 0 {
+            // Pure insertion at cursor.
+            rstart = cursor;
+        } else if ch.is_eof == true {
+            // Must match the tail of the file (anchored).
+            if orig.len() < m {
+                return ap_hunk_err(op.path_ptr, op.path_len, chunk_no,
+                    STR_PTR("end-of-file chunk longer than file"), STR_LEN("end-of-file chunk longer than file"), cursor + 1);
+            };
+            let anchored = orig.len() - m;
+            if ap_match_at(orig, anchored, ch.old_lines) != true {
+                return ap_hunk_err(op.path_ptr, op.path_len, chunk_no,
+                    STR_PTR("does not match at end of file"), STR_LEN("does not match at end of file"), orig.len() + 1);
+            };
+            rstart = anchored;
+        } else {
+            let (sidx, sfound) = ap_seek(orig, ch.old_lines, cursor);
+            if sfound != true {
+                let b = ap_buf_new(160);
+                let b2 = ap_buf_str(b, STR_PTR("could not find "), STR_LEN("could not find "));
+                let b3 = ap_buf_u64(b2, m);
+                let b4 = ap_buf_str(b3, STR_PTR(" old line(s)"), STR_LEN(" old line(s)"));
+                return ap_hunk_err(op.path_ptr, op.path_len, chunk_no, b4.ptr, b4.len, cursor + 1);
+            };
+            rstart = sidx;
+        };
+        // Overlap guard (also enforces chunk order).
+        if rstart < prev_end {
+            return ap_hunk_err(op.path_ptr, op.path_len, chunk_no,
+                STR_PTR("overlaps a previous hunk"), STR_LEN("overlaps a previous hunk"), rstart + 1);
+        };
+        reps.push(ApReplacement { start: rstart, old_len: m, new_lines: ch.new_lines });
+        prev_end = rstart + m;
+        if m > 0 {
+            cursor = rstart + m;
+        };
+        ci = ci + 1;
+    }
+    return ApChunkResult { ok: true, err_ptr: PTR_NULL(), err_len: 0, reps: reps };
+}
+
+// Build new file content from original lines + replacements.
+// Result ends with exactly one trailing newline when non-empty.
+fn ap_build_new(orig: Vec<ApLine>, reps: Vec<ApReplacement>) -> ApBuf {
+    let mut out = ap_buf_new(4096);
+    var prev: u64;
+    prev = 0;
+    var r: u64;
+    r = 0;
+    while r < reps.len() {
+        let rp = reps[r];
+        var k: u64;
+        k = prev;
+        while k < rp.start {
+            let l = orig[k];
+            out = ap_buf_push(out, l.ptr, l.len);
+            out = ap_buf_byte(out, 10);
+            k = k + 1;
+        }
+        var j: u64;
+        j = 0;
+        while j < rp.new_lines.len() {
+            let l = rp.new_lines[j];
+            out = ap_buf_push(out, l.ptr, l.len);
+            out = ap_buf_byte(out, 10);
+            j = j + 1;
+        }
+        prev = rp.start + rp.old_len;
+        r = r + 1;
+    }
+    var k2: u64;
+    k2 = prev;
+    while k2 < orig.len() {
+        let l = orig[k2];
+        out = ap_buf_push(out, l.ptr, l.len);
+        out = ap_buf_byte(out, 10);
+        k2 = k2 + 1;
+    }
+    return out;
+}
+
+// Split file content into lines, dropping the trailing empty element that
+// results from a final newline (codex parity: line counts match `diff`).
+fn ap_file_lines(p: ptr, n: u64) -> Vec<ApLine> {
+    let v = ap_split_lines(p, n);
+    let nv = v.len();
+    if nv > 0 {
+        let last = v[nv - 1];
+        if last.len == 0 {
+            // Rebuild without the last element (Vec has no pop; copy).
+            let out: Vec<ApLine> = Vec::new();
+            var i: u64;
+            i = 0;
+            while i + 1 < nv {
+                out.push(v[i]);
+                i = i + 1;
+            }
+            return out;
+        };
+    };
+    return v;
+}
+
+// ---- file IO helpers ----
+
+fn ap_path_exists(p: ptr, n: u64) -> bool {
+    let flag: u64 = 0;
+    let st = sa_std_fs_try_exists(p, n, &flag);
+    if st != 0 {
+        return false;
+    };
+    return flag != 0;
+}
+
+// Read whole file; returns (data_ptr, data_len, ok).
+fn ap_read_file(p: ptr, n: u64) -> (ptr, u64, bool) {
+    let buf: u64 = 0;
+    let st = sa_std_fs_read_file(p, n, 67108864, &buf);
+    if st != 0 {
+        return (PTR_NULL(), 0, false);
+    };
+    let dlen = sa_fs_read_buffer_len(buf);
+    if dlen == 0 {
+        let fr = sa_fs_read_buffer_free(buf);
+        return (STR_PTR(""), 0, true);
+    };
+    let dref = sa_fs_read_buffer_data(buf);
+    let dptr: ptr = dref;
+    // NOTE: buffer intentionally not freed; the returned slice borrows it.
+    return (dptr, dlen, true);
+}
+
+fn ap_write_file(p: ptr, n: u64, d: ptr, dl: u64) -> bool {
+    return sa_fs_write_file(p, n, d, dl) == 0;
+}
+
+fn ap_remove_file(p: ptr, n: u64) -> bool {
+    return sa_std_fs_remove(p, n) == 0;
+}
+
+// ---- two-phase apply ----
+
+
+fn ap_apply_err(msg_ptr: ptr, msg_len: u64) -> ApApplyResult {
+    let ec: Vec<ApPlanned> = Vec::new();
+    return ApApplyResult { ok: false, err_ptr: msg_ptr, err_len: msg_len, files_changed: 0, changed: ec };
+}
+
+fn ap_op_err(verb_ptr: ptr, verb_len: u64, path_ptr: ptr, path_len: u64, why_ptr: ptr, why_len: u64) -> ApApplyResult {
+    let b = ap_buf_new(256);
+    let b2 = ap_buf_str(b, STR_PTR("cannot "), STR_LEN("cannot "));
+    let b3 = ap_buf_str(b2, verb_ptr, verb_len);
+    let b4 = ap_buf_str(b3, STR_PTR(" '"), STR_LEN(" '"));
+    let b5 = ap_buf_str(b4, path_ptr, path_len);
+    let b6 = ap_buf_str(b5, STR_PTR("': "), STR_LEN("': "));
+    let b7 = ap_buf_str(b6, why_ptr, why_len);
+    return ap_apply_err(b7.ptr, b7.len);
+}
+
+// Phase 1: validate every op and compute all new contents. No writes happen.
+fn ap_plan_ops(ops: Vec<ApFileOp>) -> ApApplyResult {
+    let planned: Vec<ApPlanned> = Vec::new();
+    var oi: u64;
+    oi = 0;
+    while oi < ops.len() {
+        let op = ops[oi];
+        if op.kind == AP_OP_ADD {
+            if ap_path_exists(op.path_ptr, op.path_len) == true {
+                return ap_op_err(STR_PTR("add"), STR_LEN("add"), op.path_ptr, op.path_len,
+                    STR_PTR("file already exists"), STR_LEN("file already exists"));
+            };
+            planned.push(ApPlanned {
+                kind: 0,
+                path_ptr: op.path_ptr, path_len: op.path_len,
+                data_ptr: op.add_ptr, data_len: op.add_len,
+                del_ptr: PTR_NULL(), del_len: 0, has_del: false,
+                show_ptr: op.path_ptr, show_len: op.path_len,
+                orig_ptr: PTR_NULL(), orig_len: 0, had_orig: false,
+            });
+        } else if op.kind == AP_OP_DELETE {
+            if ap_path_exists(op.path_ptr, op.path_len) != true {
+                return ap_op_err(STR_PTR("delete"), STR_LEN("delete"), op.path_ptr, op.path_len,
+                    STR_PTR("file does not exist"), STR_LEN("file does not exist"));
+            };
+            let (del_dptr, del_dlen, del_dok) = ap_read_file(op.path_ptr, op.path_len);
+            if del_dok != true {
+                return ap_op_err(STR_PTR("delete"), STR_LEN("delete"), op.path_ptr, op.path_len,
+                    STR_PTR("cannot read file"), STR_LEN("cannot read file"));
+            };
+            planned.push(ApPlanned {
+                kind: 1,
+                path_ptr: op.path_ptr, path_len: op.path_len,
+                data_ptr: PTR_NULL(), data_len: 0,
+                del_ptr: PTR_NULL(), del_len: 0, has_del: false,
+                show_ptr: op.path_ptr, show_len: op.path_len,
+                orig_ptr: del_dptr, orig_len: del_dlen, had_orig: true,
+            });
+        } else {
+            // UPDATE
+            let (dptr, dlen, dok) = ap_read_file(op.path_ptr, op.path_len);
+            if dok != true {
+                return ap_op_err(STR_PTR("update"), STR_LEN("update"), op.path_ptr, op.path_len,
+                    STR_PTR("cannot read file"), STR_LEN("cannot read file"));
+            };
+            let orig = ap_file_lines(dptr, dlen);
+            let cr = ap_compute_reps(op, orig);
+            if cr.ok != true {
+                return ap_apply_err(cr.err_ptr, cr.err_len);
+            };
+            let newb = ap_build_new(orig, cr.reps);
+            var wptr: ptr;
+            var wlen: u64;
+            var sptr: ptr;
+            var slen: u64;
+            var dptr2: ptr;
+            var dlen2: u64;
+            var hasd: bool;
+            wptr = op.path_ptr;
+            wlen = op.path_len;
+            sptr = op.path_ptr;
+            slen = op.path_len;
+            dptr2 = PTR_NULL();
+            dlen2 = 0;
+            hasd = false;
+            if op.has_move == true {
+                if ap_path_exists(op.move_ptr, op.move_len) == true {
+                    return ap_op_err(STR_PTR("move"), STR_LEN("move"), op.move_ptr, op.move_len,
+                        STR_PTR("destination already exists"), STR_LEN("destination already exists"));
+                };
+                wptr = op.move_ptr;
+                wlen = op.move_len;
+                sptr = op.move_ptr;
+                slen = op.move_len;
+                dptr2 = op.path_ptr;
+                dlen2 = op.path_len;
+                hasd = true;
+            };
+            planned.push(ApPlanned {
+                kind: 0,
+                path_ptr: wptr, path_len: wlen,
+                data_ptr: newb.ptr, data_len: newb.len,
+                del_ptr: dptr2, del_len: dlen2, has_del: hasd,
+                show_ptr: sptr, show_len: slen,
+                orig_ptr: dptr, orig_len: dlen, had_orig: true,
+            });
+        };
+        oi = oi + 1;
+    }
+    return ApApplyResult { ok: true, err_ptr: PTR_NULL(), err_len: 0, files_changed: planned.len(), changed: planned };
+}
+
+// Phase 2: execute the plan. Validation already passed, so failures here
+// are unexpected IO errors. On the first failure, all previously applied
+// ops are rolled back in reverse order (best-effort), then the error is
+// reported. Rollback failures are ignored: the original error is what the
+// caller sees.
+fn ap_exec_plan(planned: Vec<ApPlanned>) -> ApApplyResult {
+    var i: u64;
+    i = 0;
+    while i < planned.len() {
+        let pl = planned[i];
+        let (ok, fmsg_ptr, fmsg_len) = ap_exec_one(pl);
+        if ok != true {
+            // Roll back ops [0, i) in reverse order.
+            ap_rollback_plan(planned, i);
+            let b = ap_buf_new(192);
+            let b2 = ap_buf_str(b, fmsg_ptr, fmsg_len);
+            let b3 = ap_buf_str(b2, pl.path_ptr, pl.path_len);
+            let b4 = ap_buf_str(b3, STR_PTR("'"), STR_LEN("'"));
+            return ap_apply_err(b4.ptr, b4.len);
+        };
+        i = i + 1;
+    }
+    return ApApplyResult { ok: true, err_ptr: PTR_NULL(), err_len: 0, files_changed: planned.len(), changed: planned };
+}
+
+// Execute a single planned op. Returns (ok, msg_ptr, msg_len); msg is the
+// failure prefix ("... failed for '") when ok is false.
+fn ap_exec_one(pl: ApPlanned) -> (bool, ptr, u64) {
+    if pl.kind == 1 {
+        if ap_remove_file(pl.path_ptr, pl.path_len) != true {
+            return (false, STR_PTR("delete failed for '"), STR_LEN("delete failed for '"));
+        };
+        return (true, PTR_NULL(), 0);
+    };
+    if ap_write_file(pl.path_ptr, pl.path_len, pl.data_ptr, pl.data_len) != true {
+        return (false, STR_PTR("write failed for '"), STR_LEN("write failed for '"));
+    };
+    if pl.has_del == true {
+        if ap_remove_file(pl.del_ptr, pl.del_len) != true {
+            return (false, STR_PTR("move cleanup failed for '"), STR_LEN("move cleanup failed for '"));
+        };
+    };
+    return (true, PTR_NULL(), 0);
+}
+
+// Best-effort rollback of the first `count` planned ops, in reverse order.
+fn ap_rollback_plan(planned: Vec<ApPlanned>, count: u64) -> void {
+    var i: u64;
+    i = count;
+    while i > 0 {
+        i = i - 1;
+        let pl = planned[i];
+        if pl.kind == 1 {
+            // Was a delete: restore the original content.
+            if pl.had_orig == true {
+                let _ = ap_write_file(pl.path_ptr, pl.path_len, pl.orig_ptr, pl.orig_len);
+            };
+        } else {
+            if pl.has_del == true {
+                // Was a move: remove the new path, restore the old one.
+                let _ = ap_remove_file(pl.path_ptr, pl.path_len);
+                if pl.had_orig == true {
+                    let _ = ap_write_file(pl.del_ptr, pl.del_len, pl.orig_ptr, pl.orig_len);
+                };
+            } else if pl.had_orig == true {
+                // Was an update: restore the original content.
+                let _ = ap_write_file(pl.path_ptr, pl.path_len, pl.orig_ptr, pl.orig_len);
+            } else {
+                // Was an add: remove the created file.
+                let _ = ap_remove_file(pl.path_ptr, pl.path_len);
+            };
+        };
+    }
+}
+
+// ---- unified diff preview (no writes) ----
+
+fn ap_diff_u64(out: ApBuf, v: u64) -> ApBuf {
+    return ap_buf_u64(out, v);
+}
+
+// Render one file's replacements as unified hunks with 3 lines of context.
+fn ap_render_update_diff(out: ApBuf, path_ptr: ptr, path_len: u64, orig: Vec<ApLine>, reps: Vec<ApReplacement>) -> ApBuf {
+    let mut b = out;
+    b = ap_buf_str(b, STR_PTR("--- a/"), STR_LEN("--- a/"));
+    b = ap_buf_str(b, path_ptr, path_len);
+    b = ap_buf_byte(b, 10);
+    b = ap_buf_str(b, STR_PTR("+++ b/"), STR_LEN("+++ b/"));
+    b = ap_buf_str(b, path_ptr, path_len);
+    b = ap_buf_byte(b, 10);
+    let n = orig.len();
+    var r: u64;
+    r = 0;
+    while r < reps.len() {
+        let rp = reps[r];
+        var hs: u64;
+        hs = 0;
+        if rp.start > 3 {
+            hs = rp.start - 3;
+        };
+        var he: u64;
+        he = rp.start + rp.old_len + 3;
+        if he > n {
+            he = n;
+        };
+        let old_count = he - hs;
+        let new_count = old_count - rp.old_len + rp.new_lines.len();
+        b = ap_buf_str(b, STR_PTR("@@ -"), STR_LEN("@@ -"));
+        b = ap_diff_u64(b, hs + 1);
+        b = ap_buf_byte(b, 44);
+        b = ap_diff_u64(b, old_count);
+        b = ap_buf_str(b, STR_PTR(" +"), STR_LEN(" +"));
+        b = ap_diff_u64(b, hs + 1);
+        b = ap_buf_byte(b, 44);
+        b = ap_diff_u64(b, new_count);
+        b = ap_buf_str(b, STR_PTR(" @@"), STR_LEN(" @@"));
+        b = ap_buf_byte(b, 10);
+        // Pre-context.
+        var k: u64;
+        k = hs;
+        while k < rp.start {
+            let l = orig[k];
+            b = ap_buf_byte(b, 32);
+            b = ap_buf_push(b, l.ptr, l.len);
+            b = ap_buf_byte(b, 10);
+            k = k + 1;
+        }
+        // Removed lines.
+        var d: u64;
+        d = 0;
+        while d < rp.old_len {
+            let l = orig[rp.start + d];
+            b = ap_buf_byte(b, 45);
+            b = ap_buf_push(b, l.ptr, l.len);
+            b = ap_buf_byte(b, 10);
+            d = d + 1;
+        }
+        // Added lines.
+        var a: u64;
+        a = 0;
+        while a < rp.new_lines.len() {
+            let l = rp.new_lines[a];
+            b = ap_buf_byte(b, 43);
+            b = ap_buf_push(b, l.ptr, l.len);
+            b = ap_buf_byte(b, 10);
+            a = a + 1;
+        }
+        // Post-context.
+        var k2: u64;
+        k2 = rp.start + rp.old_len;
+        while k2 < he {
+            let l = orig[k2];
+            b = ap_buf_byte(b, 32);
+            b = ap_buf_push(b, l.ptr, l.len);
+            b = ap_buf_byte(b, 10);
+            k2 = k2 + 1;
+        }
+        r = r + 1;
+    }
+    return b;
+}
+
+struct ApPreview {
+    ok: bool,
+    diff_ptr: ptr,
+    diff_len: u64,
+    err_ptr: ptr,
+    err_len: u64,
+}
+
+// Compute the unified diff for a patch WITHOUT writing anything.
+fn ap_preview_patch(patch_ptr: ptr, patch_len: u64) -> ApPreview {
+    let po = ap_parse(patch_ptr, patch_len);
+    if po.ok != true {
+        let b = ap_parse_err_text(po);
+        return ApPreview { ok: false, diff_ptr: PTR_NULL(), diff_len: 0, err_ptr: b.ptr, err_len: b.len };
+    };
+    let plan = ap_plan_ops(po.ops);
+    if plan.ok != true {
+        return ApPreview { ok: false, diff_ptr: PTR_NULL(), diff_len: 0, err_ptr: plan.err_ptr, err_len: plan.err_len };
+    };
+    let mut b = ap_buf_new(1024);
+    var i: u64;
+    i = 0;
+    while i < po.ops.len() {
+        let op = po.ops[i];
+        if op.kind == AP_OP_ADD {
+            b = ap_buf_str(b, STR_PTR("--- /dev/null\n+++ b/"), STR_LEN("--- /dev/null\n+++ b/"));
+            b = ap_buf_str(b, op.path_ptr, op.path_len);
+            b = ap_buf_byte(b, 10);
+            b = ap_buf_str(b, STR_PTR("@@ -0,0 +1,"), STR_LEN("@@ -0,0 +1,"));
+            let add_lines = ap_file_lines(op.add_ptr, op.add_len);
+            b = ap_diff_u64(b, add_lines.len());
+            b = ap_buf_str(b, STR_PTR(" @@"), STR_LEN(" @@"));
+            b = ap_buf_byte(b, 10);
+            var k: u64;
+            k = 0;
+            while k < add_lines.len() {
+                let l = add_lines[k];
+                b = ap_buf_byte(b, 43);
+                b = ap_buf_push(b, l.ptr, l.len);
+                b = ap_buf_byte(b, 10);
+                k = k + 1;
+            }
+        } else if op.kind == AP_OP_DELETE {
+            let (dptr, dlen, dok) = ap_read_file(op.path_ptr, op.path_len);
+            if dok != true {
+                return ApPreview { ok: false, diff_ptr: PTR_NULL(), diff_len: 0, err_ptr: plan.err_ptr, err_len: plan.err_len };
+            };
+            let orig = ap_file_lines(dptr, dlen);
+            b = ap_buf_str(b, STR_PTR("--- a/"), STR_LEN("--- a/"));
+            b = ap_buf_str(b, op.path_ptr, op.path_len);
+            b = ap_buf_byte(b, 10);
+            b = ap_buf_str(b, STR_PTR("+++ /dev/null"), STR_LEN("+++ /dev/null"));
+            b = ap_buf_byte(b, 10);
+            b = ap_buf_str(b, STR_PTR("@@ -1,"), STR_LEN("@@ -1,"));
+            b = ap_diff_u64(b, orig.len());
+            b = ap_buf_str(b, STR_PTR(" +0,0 @@"), STR_LEN(" +0,0 @@"));
+            b = ap_buf_byte(b, 10);
+            var k2: u64;
+            k2 = 0;
+            while k2 < orig.len() {
+                let l = orig[k2];
+                b = ap_buf_byte(b, 45);
+                b = ap_buf_push(b, l.ptr, l.len);
+                b = ap_buf_byte(b, 10);
+                k2 = k2 + 1;
+            }
+        } else {
+            let (dptr2, dlen2, dok2) = ap_read_file(op.path_ptr, op.path_len);
+            if dok2 != true {
+                return ApPreview { ok: false, diff_ptr: PTR_NULL(), diff_len: 0, err_ptr: plan.err_ptr, err_len: plan.err_len };
+            };
+            let orig2 = ap_file_lines(dptr2, dlen2);
+            let cr = ap_compute_reps(op, orig2);
+            if cr.ok != true {
+                return ApPreview { ok: false, diff_ptr: PTR_NULL(), diff_len: 0, err_ptr: cr.err_ptr, err_len: cr.err_len };
+            };
+            b = ap_render_update_diff(b, op.path_ptr, op.path_len, orig2, cr.reps);
+        };
+        i = i + 1;
+    }
+    return ApPreview { ok: true, diff_ptr: b.ptr, diff_len: b.len, err_ptr: PTR_NULL(), err_len: 0 };
+}
+
+// ---- public entry points ----
+
+// Parse + validate + apply. Returns per-file change list on success.
+fn ap_apply_patch(patch_ptr: ptr, patch_len: u64) -> ApApplyResult {
+    let po = ap_parse(patch_ptr, patch_len);
+    if po.ok != true {
+        let b = ap_parse_err_text(po);
+        return ap_apply_err(b.ptr, b.len);
+    };
+    let plan = ap_plan_ops(po.ops);
+    if plan.ok != true {
+        return plan;
+    };
+    return ap_exec_plan(plan.changed);
+}
+
+// Format a parse error as "patch line N: <msg>".
+fn ap_parse_err_text(po: ApParseOut) -> ApBuf {
+    let b = ap_buf_new(192);
+    let b2 = ap_buf_str(b, STR_PTR("patch line "), STR_LEN("patch line "));
+    let b3 = ap_buf_u64(b2, po.err_line);
+    let b4 = ap_buf_str(b3, STR_PTR(": "), STR_LEN(": "));
+    let b5 = ap_buf_str(b4, po.err_ptr, po.err_len);
+    return b5;
+}
