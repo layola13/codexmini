@@ -10,6 +10,7 @@
 @import "config.sla"
 @import "model.sla"
 @import "image.sla"
+@import "sandbox.sla"
 
 
 // mini_cli_arg(idx): argv[idx] as (ptr, len, ok). ok=false when missing,
@@ -265,6 +266,28 @@ fn main() -> i32 {
             mcp_ptr = mcp;
             mcp_len = mcl;
             arg_base = 3;
+        };
+    };
+    // Linux Landlock sandbox. One-shot self-restriction inherited by every
+    // child (shell_exec, curl, MCP servers). Opt-out is explicit only:
+    //   scodex-mini --dangerously-skip-sandbox ...
+    //   SCODEX_SANDBOX=0 scodex-mini ...
+    // Any sandbox failure aborts instead of running unsandboxed.
+    let (s1p, s1l, s1ok) = mini_cli_arg(arg_base);
+    if s1ok == true {
+        if mini_model_str_eq(s1p, s1l, STR_PTR("--dangerously-skip-sandbox"), STR_LEN("--dangerously-skip-sandbox")) == true {
+            println("scodex-mini: WARNING: sandbox explicitly disabled via --dangerously-skip-sandbox.");
+            arg_base = arg_base + 1;
+        } else {
+            let sbrc = sandbox_activate();
+            if sbrc != 0 {
+                return 2;
+            };
+        };
+    } else {
+        let sbrc = sandbox_activate();
+        if sbrc != 0 {
+            return 2;
         };
     };
     let (b1p, b1l, b1ok) = mini_cli_arg(arg_base);

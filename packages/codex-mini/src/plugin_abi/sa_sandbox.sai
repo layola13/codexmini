@@ -1,0 +1,27 @@
+// SA-facing ABI for the Landlock sandbox plugin.
+//
+// One-shot self-restriction model: the calling process restricts ITSELF via
+// landlock_restrict_self(). The policy is inherited by all future children
+// (fork/exec), so every spawn path (sa_std process APIs, curl subprocesses,
+// MCP servers) is covered with a single call. There is intentionally no
+// "unsandbox" call — Landlock restrictions cannot be undone.
+//
+// Only filesystem rights are handled; network access is untouched, so API
+// calls keep working under the sandbox.
+//
+// Status codes (u32 return):
+//   0  ok
+//   1  unsupported (kernel has no Landlock; need Linux 5.13+)
+//   2  invalid argument (null/empty path, bad out pointer)
+//   3  no active policy (add/commit without begin, or double begin)
+//   4  ruleset/add_rule/restrict_self syscall failed (errno in out_errno)
+//   5  path could not be opened for rule installation (errno in out_errno;
+//      ENOENT is silently skipped: missing system dirs are fail-closed anyway)
+
+@extern sa_sandbox_landlock_abi() -> u32
+@extern sa_sandbox_policy_begin() -> u32
+@extern sa_sandbox_policy_add_ro(&path: ptr, path_len: u64) -> u32
+@extern sa_sandbox_policy_add_rw(&path: ptr, path_len: u64) -> u32
+@extern sa_sandbox_policy_add_exec(&path: ptr, path_len: u64) -> u32
+@extern sa_sandbox_policy_add_rwx(&path: ptr, path_len: u64) -> u32
+@extern sa_sandbox_policy_commit(&out_errno: ptr) -> u32

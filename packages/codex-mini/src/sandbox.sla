@@ -1,0 +1,146 @@
+// Linux Landlock sandbox for scodex-mini tool execution.
+//
+// One-shot self-restriction: the policy is installed once at startup and is
+// inherited by every child process (shell_exec, apply_patch helpers, curl
+// subprocesses, MCP servers). There is no way to unsandbox afterwards.
+//
+// Default-deny filesystem policy:
+//   RO   /usr /lib /lib64 /bin /sbin /etc /opt /proc /sys
+//   EXEC /usr /bin /lib /lib64 /sbin /opt        (read + execute)
+//   RW   /dev /tmp /var/tmp $TMPDIR
+//   RWX  $CWD (workspace)  $HOME/.scodex-mini    (read + write + execute)
+// Everything else (notably the rest of $HOME, e.g. ~/.ssh) is denied.
+// Network access is untouched: the model API keeps working.
+//
+// Escape hatches (explicit, never silent):
+//   --dangerously-skip-sandbox   CLI flag, parsed in main.sla
+//   SCODEX_SANDBOX=0             environment variable
+// If Landlock is unsupported the process exits non-zero instead of running
+// unsandboxed.
+
+@import "plugin_abi/sa_sandbox.sai"
+@import "sa_std/env.sa"
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/io/print.sai"
+@import "slicex.sa"
+@import "sessionx.sa"
+@import "config.sla"
+
+// Rule kinds for sandbox_add_path.
+const SB_RO: u64 = 0;
+const SB_RW: u64 = 1;
+const SB_EXEC: u64 = 2;
+const SB_RWX: u64 = 3;
+
+fn sandbox_add_path(kind: u64, p: ptr, len: u64) -> u32 {
+    if len == 0 {
+        return 2;
+    };
+    if kind == SB_RO {
+        return sa_sandbox_policy_add_ro(p, len);
+    };
+    if kind == SB_RW {
+        return sa_sandbox_policy_add_rw(p, len);
+    };
+    if kind == SB_EXEC {
+        return sa_sandbox_policy_add_exec(p, len);
+    };
+    return sa_sandbox_policy_add_rwx(p, len);
+}
+
+fn sandbox_add2(kind: u64, p1: ptr, l1: u64, p2: ptr, l2: u64) -> u32 {
+    let st = sandbox_add_path(kind, p1, l1);
+    if st != 0 {
+        return st;
+    };
+    return sandbox_add_path(kind, p2, l2);
+}
+
+// $HOME/.scodex-mini — the session DB dir. Built with the heap-buffer idiom
+// (X_HEAP_BUF_PTR/X_COPY_BYTES/X_PTR_ADD) like model.sla's URL builder.
+fn sandbox_add_session_dir() -> u32 {
+    let home_ptr = STR_PTR("HOME");
+    let (hptr, hlen) = mini_config_env_or(home_ptr, STR_LEN("HOME"), PTR_NULL(), 0);
+    if hlen == 0 {
+        return 0;
+    };
+    let sfx_ptr = STR_PTR("/.scodex-mini");
+    let sfx_len = STR_LEN("/.scodex-mini");
+    let total = hlen + sfx_len;
+    let out = X_HEAP_BUF_PTR(total);
+    X_COPY_BYTES(out, hptr, hlen);
+    X_COPY_BYTES(X_PTR_ADD(out, hlen), sfx_ptr, sfx_len);
+    return sandbox_add_path(SB_RWX, out, total);
+}
+
+fn sandbox_apply_default_policy() -> u32 {
+    let st = sa_sandbox_policy_begin();
+    if st == 1 {
+        println("scodex-mini: Landlock is not supported by this kernel; refusing to run unsandboxed.");
+        return 1;
+    };
+    if st != 0 {
+        println("scodex-mini: sandbox policy begin failed.");
+        return st;
+    };
+    // Read-only system paths.
+    let ro1 = sandbox_add2(SB_RO, STR_PTR("/usr"), STR_LEN("/usr"), STR_PTR("/lib"), STR_LEN("/lib"));
+    let ro2 = sandbox_add2(SB_RO, STR_PTR("/lib64"), STR_LEN("/lib64"), STR_PTR("/bin"), STR_LEN("/bin"));
+    let ro3 = sandbox_add2(SB_RO, STR_PTR("/sbin"), STR_LEN("/sbin"), STR_PTR("/etc"), STR_LEN("/etc"));
+    let ro4 = sandbox_add2(SB_RO, STR_PTR("/opt"), STR_LEN("/opt"), STR_PTR("/proc"), STR_LEN("/proc"));
+    let ro5 = sandbox_add_path(SB_RO, STR_PTR("/sys"), STR_LEN("/sys"));
+    // Executable system paths (read + execute; needed for /bin/sh, python, ...).
+    let ex1 = sandbox_add2(SB_EXEC, STR_PTR("/usr"), STR_LEN("/usr"), STR_PTR("/bin"), STR_LEN("/bin"));
+    let ex2 = sandbox_add2(SB_EXEC, STR_PTR("/lib"), STR_LEN("/lib"), STR_PTR("/lib64"), STR_LEN("/lib64"));
+    let ex3 = sandbox_add2(SB_EXEC, STR_PTR("/sbin"), STR_LEN("/sbin"), STR_PTR("/opt"), STR_LEN("/opt"));
+    // Writable scratch areas.
+    let rw1 = sandbox_add2(SB_RW, STR_PTR("/dev"), STR_LEN("/dev"), STR_PTR("/tmp"), STR_LEN("/tmp"));
+    let rw2 = sandbox_add_path(SB_RW, STR_PTR("/var/tmp"), STR_LEN("/var/tmp"));
+    let (tmp_ptr, tmp_len) = mini_config_env_or(STR_PTR("TMPDIR"), STR_LEN("TMPDIR"), STR_PTR("/tmp"), STR_LEN("/tmp"));
+    let rw3 = sandbox_add_path(SB_RW, tmp_ptr, tmp_len);
+    // Workspace: full read/write/execute.
+    let cwdb = ENV_CURRENT_DIR();
+    let cwp = ENV_BUFFER_DATA(cwdb);
+    let cwl = ENV_BUFFER_LEN(cwdb);
+    let ws = sandbox_add_path(SB_RWX, cwp, cwl);
+    // Session DB dir.
+    let db = sandbox_add_session_dir();
+    let add_st = ro1 + ro2 + ro3 + ro4 + ro5 + ex1 + ex2 + ex3 + rw1 + rw2 + rw3 + ws + db;
+    if add_st != 0 {
+        println("scodex-mini: sandbox policy rule installation failed.");
+        return 5;
+    };
+    let errno_slot: u64 = 0;
+    let cst = sa_sandbox_policy_commit(&errno_slot);
+    if cst != 0 {
+        println("scodex-mini: sandbox commit failed; refusing to run unsandboxed.");
+        return cst;
+    };
+    return 0;
+}
+
+// Returns 0 when sandboxed (or explicitly skipped), non-zero on fatal error.
+// Never silently runs unsandboxed: any failure aborts the process.
+fn sandbox_activate() -> u64 {
+    let (sflag_ptr, sflag_len) = mini_config_env_or(
+        STR_PTR("SCODEX_SANDBOX"), STR_LEN("SCODEX_SANDBOX"),
+        STR_PTR("1"), STR_LEN("1"));
+    if sflag_len == 1 {
+        let first = X_LOAD_U8(sflag_ptr);
+        if first == 48 {
+            println("scodex-mini: sandbox disabled via SCODEX_SANDBOX=0.");
+            return 0;
+        };
+    };
+    let abi = sa_sandbox_landlock_abi();
+    if abi == 0 {
+        println("scodex-mini: Landlock is not supported by this kernel; refusing to run unsandboxed.");
+        return 1;
+    };
+    let st = sandbox_apply_default_policy();
+    if st != 0 {
+        return st as u64;
+    };
+    return 0;
+}
