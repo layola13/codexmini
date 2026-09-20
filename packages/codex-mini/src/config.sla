@@ -39,12 +39,14 @@ fn mini_config_env_or(key_lit_ptr: ptr, key_lit_len: u64, fallback_ptr: ptr, fal
 }
 
 // mini_config_servers_from_json: parse {"name": {"command","args","env"}}
-// into the registry. Returns the number of servers added. Malformed entries
-// are skipped with an explicit warning (never silently misconfigured).
+// into the registry vec. Takes ownership of the vec and returns the updated
+// vec (linear threading: the caller's vec is moved in, pushes are preserved).
+// Malformed entries are skipped with an explicit warning
+// (never silently misconfigured).
 fn mini_config_servers_from_json(
     servers: Vec<MiniMcpServer>,
     obj_node: ptr,
-) -> u64 {
+) -> Vec<MiniMcpServer> {
     var added: u64;
     added = 0;
     var ki: u64;
@@ -83,7 +85,82 @@ fn mini_config_servers_from_json(
             ki = ki + 1;
         };
     }
-    return added;
+    return servers;
+}
+
+// mini_config_mcp_stage_env: source 1, SCODEX_MCP_SERVERS env (JSON object,
+// same shape as the config file). Takes ownership of the registry vec and
+// returns the updated vec.
+fn mini_config_mcp_stage_env(servers: Vec<MiniMcpServer>) -> Vec<MiniMcpServer> {
+    let (se_ptr, se_len) = mini_config_env_or(
+        STR_PTR("SCODEX_MCP_SERVERS"), STR_LEN("SCODEX_MCP_SERVERS"), PTR_NULL(), 0);
+    if se_len == 0 {
+        return servers;
+    };
+    let se_root = JSON_PARSE(se_ptr, se_len);
+    let se_is_obj: bool = false;
+    JSON_IS_OBJECT(se_is_obj, se_root);
+    if se_is_obj == true {
+        return mini_config_servers_from_json(servers, se_root);
+    };
+    println("scodex-mini: SCODEX_MCP_SERVERS must be a JSON object, ignored");
+    return servers;
+}
+
+// mini_config_mcp_stage_file: source 2, <config file> "mcp_servers" object.
+// Takes ownership of the registry vec and returns the updated vec.
+fn mini_config_mcp_stage_file(servers: Vec<MiniMcpServer>) -> Vec<MiniMcpServer> {
+    let (cfg_path_ptr, cfg_path_len) = mini_config_path();
+    if cfg_path_len == 0 {
+        return servers;
+    };
+    let fbuf: u64 = 0;
+    let fst = sa_std_fs_read_to_string(cfg_path_ptr, cfg_path_len, 1048576, &fbuf);
+    if fst != 0 {
+        return servers;
+    };
+    let flen = sa_fs_read_buffer_len(fbuf);
+    if flen == 0 {
+        return servers;
+    };
+    let fref = sa_fs_read_buffer_data(fbuf);
+    let fptr: ptr = fref;
+    let froot = JSON_PARSE(fptr, flen);
+    let has_ms: bool = false;
+    X_OBJ_HAS(has_ms, froot, STR_PTR("mcp_servers"), STR_LEN("mcp_servers"));
+    if has_ms != true {
+        return servers;
+    };
+    let ms_node: ptr = PTR_NULL();
+    let mst = sa_json_object_get(froot,
+        STR_PTR("mcp_servers"), STR_LEN("mcp_servers"), &ms_node);
+    if mst != 0 {
+        return servers;
+    };
+    let ms_is_obj: bool = false;
+    JSON_IS_OBJECT(ms_is_obj, ms_node);
+    if ms_is_obj == true {
+        return mini_config_servers_from_json(servers, ms_node);
+    };
+    println("scodex-mini: config: \"mcp_servers\" must be an object, ignored");
+    return servers;
+}
+
+// mini_config_mcp_stage_legacy: source 3, SCODEX_MCP env (single legacy
+// server, registered as "default"). Takes ownership of the registry vec and
+// returns the updated vec.
+fn mini_config_mcp_stage_legacy(servers: Vec<MiniMcpServer>) -> Vec<MiniMcpServer> {
+    let (mcp_ptr, mcp_len) = mini_config_env_or(STR_PTR("SCODEX_MCP"), STR_LEN("SCODEX_MCP"), PTR_NULL(), 0);
+    if mcp_len == 0 {
+        return servers;
+    };
+    let nbuf = X_HEAP_BUF_PTR(STR_LEN("default"));
+    X_COPY_BYTES(nbuf, STR_PTR("default"), STR_LEN("default"));
+    let cbuf = X_HEAP_BUF_PTR(mcp_len);
+    X_COPY_BYTES(cbuf, mcp_ptr, mcp_len);
+    let srv = mini_mcp_server_new(nbuf, STR_LEN("default"), cbuf, mcp_len);
+    servers.push(srv);
+    return servers;
 }
 
 // mini_config_load_mcp_servers: build the MCP server registry.
@@ -91,68 +168,14 @@ fn mini_config_servers_from_json(
 //   1. SCODEX_MCP_SERVERS env (JSON object, same shape as the config file)
 //   2. <config file> "mcp_servers" object
 //   3. SCODEX_MCP env (single legacy server, registered as "default")
+// The registry vec is threaded linearly through the stages: each stage takes
+// ownership and returns the updated vec, so no use-after-move is possible.
 fn mini_config_load_mcp_servers() -> Vec<MiniMcpServer> {
-    let servers: Vec<MiniMcpServer> = Vec::new();
-
-    // 1. SCODEX_MCP_SERVERS env
-    let (se_ptr, se_len) = mini_config_env_or(
-        STR_PTR("SCODEX_MCP_SERVERS"), STR_LEN("SCODEX_MCP_SERVERS"), PTR_NULL(), 0);
-    if se_len > 0 {
-        let se_root = JSON_PARSE(se_ptr, se_len);
-        let se_is_obj: bool = false;
-        JSON_IS_OBJECT(se_is_obj, se_root);
-        if se_is_obj == true {
-            mini_config_servers_from_json(servers, se_root);
-        };
-        if se_is_obj != true {
-            println("scodex-mini: SCODEX_MCP_SERVERS must be a JSON object, ignored");
-        };
-    };
-
-    // 2. config file "mcp_servers"
-    let (cfg_path_ptr, cfg_path_len) = mini_config_path();
-    if cfg_path_len > 0 {
-        let fbuf: u64 = 0;
-        let fst = sa_std_fs_read_to_string(cfg_path_ptr, cfg_path_len, 1048576, &fbuf);
-        if fst == 0 {
-            let flen = sa_fs_read_buffer_len(fbuf);
-            if flen > 0 {
-                let fref = sa_fs_read_buffer_data(fbuf);
-                let fptr: ptr = fref;
-                let froot = JSON_PARSE(fptr, flen);
-                let has_ms: bool = false;
-                X_OBJ_HAS(has_ms, froot, STR_PTR("mcp_servers"), STR_LEN("mcp_servers"));
-                if has_ms == true {
-                    let ms_node: ptr = PTR_NULL();
-                    let mst = sa_json_object_get(froot,
-                        STR_PTR("mcp_servers"), STR_LEN("mcp_servers"), &ms_node);
-                    if mst == 0 {
-                        let ms_is_obj: bool = false;
-                        JSON_IS_OBJECT(ms_is_obj, ms_node);
-                        if ms_is_obj == true {
-                            mini_config_servers_from_json(servers, ms_node);
-                        };
-                        if ms_is_obj != true {
-                            println("scodex-mini: config: \"mcp_servers\" must be an object, ignored");
-                        };
-                    };
-                };
-            };
-        };
-    };
-
-    // 3. legacy single-server SCODEX_MCP env
-    let (mcp_ptr, mcp_len) = mini_config_env_or(STR_PTR("SCODEX_MCP"), STR_LEN("SCODEX_MCP"), PTR_NULL(), 0);
-    if mcp_len > 0 {
-        let nbuf = X_HEAP_BUF_PTR(STR_LEN("default"));
-        X_COPY_BYTES(nbuf, STR_PTR("default"), STR_LEN("default"));
-        let cbuf = X_HEAP_BUF_PTR(mcp_len);
-        X_COPY_BYTES(cbuf, mcp_ptr, mcp_len);
-        let srv = mini_mcp_server_new(nbuf, STR_LEN("default"), cbuf, mcp_len);
-        servers.push(srv);
-    };
-
-    return servers;
+    let s0: Vec<MiniMcpServer> = Vec::new();
+    let s1 = mini_config_mcp_stage_env(s0);
+    let s2 = mini_config_mcp_stage_file(s1);
+    let s3 = mini_config_mcp_stage_legacy(s2);
+    return s3;
 }
 
 // mini_config_path: SCODEX_CONFIG env, else $HOME/.scodex-mini/config.json.
