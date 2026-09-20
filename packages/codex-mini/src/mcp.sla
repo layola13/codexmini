@@ -489,13 +489,16 @@ fn mini_mcp_route(
 // are optional. A malformed entry makes the server invalid (skipped with a
 // warning, never silently misconfigured).
 fn mini_mcp_build_server_cmd(srv_node: ptr) -> (ptr, u64, bool) {
-    let has_cmd = X_OBJ_HAS(srv_node, STR_PTR("command"), STR_LEN("command"));
+    let has_cmd: bool = false;
+    X_OBJ_HAS(has_cmd, srv_node, STR_PTR("command"), STR_LEN("command"));
     if has_cmd != true {
         println("scodex-mini: mcp config: server entry missing \"command\", skipped");
         return (PTR_NULL(), 0, false);
     };
-    let cmd_ptr = X_OBJ_STR_PTR(srv_node, STR_PTR("command"), STR_LEN("command"));
-    let cmd_len = X_OBJ_STR_LEN(srv_node, STR_PTR("command"), STR_LEN("command"));
+    let cmd_ptr: ptr = PTR_NULL();
+    X_OBJ_STR_PTR(cmd_ptr, srv_node, STR_PTR("command"), STR_LEN("command"));
+    let cmd_len: u64 = 0;
+    X_OBJ_STR_LEN(cmd_len, srv_node, STR_PTR("command"), STR_LEN("command"));
     if cmd_len == 0 {
         println("scodex-mini: mcp config: server entry has empty \"command\", skipped");
         return (PTR_NULL(), 0, false);
@@ -508,7 +511,8 @@ fn mini_mcp_build_server_cmd(srv_node: ptr) -> (ptr, u64, bool) {
     bad = 0;
 
     // env assignments first
-    let has_env = X_OBJ_HAS(srv_node, STR_PTR("env"), STR_LEN("env"));
+    let has_env: bool = false;
+    X_OBJ_HAS(has_env, srv_node, STR_PTR("env"), STR_LEN("env"));
     if has_env == true {
         let env_node: ptr = PTR_NULL();
         let eget = sa_json_object_get(srv_node, STR_PTR("env"), STR_LEN("env"), &env_node);
@@ -576,7 +580,8 @@ fn mini_mcp_build_server_cmd(srv_node: ptr) -> (ptr, u64, bool) {
 
     // args, each shell-quoted
     if bad == 0 {
-        let has_args = X_OBJ_HAS(srv_node, STR_PTR("args"), STR_LEN("args"));
+        let has_args: bool = false;
+        X_OBJ_HAS(has_args, srv_node, STR_PTR("args"), STR_LEN("args"));
         if has_args == true {
             let args_node: ptr = PTR_NULL();
             let aget = sa_json_object_get(srv_node, STR_PTR("args"), STR_LEN("args"), &args_node);
