@@ -126,8 +126,7 @@ fn mini_config_mcp_stage_file(servers: Vec<MiniMcpServer>) -> Vec<MiniMcpServer>
     let fref = sa_fs_read_buffer_data(fbuf);
     let fptr: ptr = fref;
     let froot = JSON_PARSE(fptr, flen);
-    let has_ms: bool = false;
-    X_OBJ_HAS(has_ms, froot, STR_PTR("mcp_servers"), STR_LEN("mcp_servers"));
+    let has_ms = X_OBJ_HAS(froot, STR_PTR("mcp_servers"), STR_LEN("mcp_servers"));
     if has_ms != true {
         return servers;
     };

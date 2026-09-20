@@ -213,8 +213,7 @@ fn layer_get_bool(entries: Vec<TomlEntry>, key_ptr: ptr, key_len: u64) -> (bool,
         return (false, false);
     };
     // val is "true" or "false" bytes.
-    let is_true = false;
-    X_STR_EQ(is_true, e.val_ptr, e.val_len, STR_PTR("true"), STR_LEN("true"));
+    let is_true = X_STR_EQ(e.val_ptr, e.val_len, STR_PTR("true"), STR_LEN("true"));
     if is_true == true {
         return (true, true);
     };
@@ -372,8 +371,7 @@ fn config_layers_merged(profile_ptr: ptr, profile_len: u64) -> Vec<TomlEntry> {
     let (sp, sl, ok) = layer_get_str(merged,
         STR_PTR("model"), STR_LEN("model"));
     if ok != true { panic(202); };
-    let eq = false;
-    X_STR_EQ(eq, sp, sl, STR_PTR("gpt-5"), STR_LEN("gpt-5"));
+    let eq = X_STR_EQ(sp, sl, STR_PTR("gpt-5"), STR_LEN("gpt-5"));
     if eq != true { panic(203); };
 }
 
