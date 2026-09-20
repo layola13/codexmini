@@ -131,7 +131,7 @@ fn mini_cli_run_image_mcp(path_idx: u64, mcp_ptr: ptr, mcp_len: u64) -> i32 {
         println("usage: scodex-mini --image <path> <prompt>");
         return 2;
     };
-    let cfg0 = mini_config_load();
+    let cfg0 = mini_config_load_with_profile(profile_ptr, profile_len);
     if cfg0.ok != true {
         println("scodex-mini: missing OPENAI_API_KEY");
         return 2;
@@ -181,7 +181,7 @@ fn mini_cli_run_file_mcp(path_idx: u64, mcp_ptr: ptr, mcp_len: u64) -> i32 {
         println("usage: scodex-mini --file <path> <prompt>");
         return 2;
     };
-    let cfg0 = mini_config_load();
+    let cfg0 = mini_config_load_with_profile(profile_ptr, profile_len);
     if cfg0.ok != true {
         println("scodex-mini: missing OPENAI_API_KEY");
         return 2;
@@ -232,6 +232,25 @@ fn main() -> i32 {
             mcp_ptr = mcp;
             mcp_len = mcl;
             arg_base = 3;
+        };
+    };
+    // --profile <name>: select a config profile (SCODEX_PROFILE env fallback).
+    // Parsed before sandbox so the profile applies to the whole run.
+    var profile_ptr: ptr;
+    var profile_len: u64;
+    profile_ptr = PTR_NULL();
+    profile_len = 0;
+    let (pa1p, pa1l, pa1ok) = mini_cli_arg(arg_base);
+    if pa1ok == true {
+        if mini_model_str_eq(pa1p, pa1l, STR_PTR("--profile"), STR_LEN("--profile")) == true {
+            let (pnp, pnl, pnok) = mini_cli_arg(arg_base + 1);
+            if pnok != true {
+                println("usage: scodex-mini --profile <name> <prompt>");
+                return 2;
+            };
+            profile_ptr = pnp;
+            profile_len = pnl;
+            arg_base = arg_base + 2;
         };
     };
     // Linux Landlock sandbox. One-shot self-restriction inherited by every
@@ -285,7 +304,7 @@ fn main() -> i32 {
                 println("usage: scodex-mini --resume <id> <prompt>");
                 return 2;
             };
-            let cfg0 = mini_config_load();
+            let cfg0 = mini_config_load_with_profile(profile_ptr, profile_len);
             if cfg0.ok != true {
                 println("scodex-mini: missing OPENAI_API_KEY");
                 return 2;
@@ -318,7 +337,7 @@ fn main() -> i32 {
             return mini_cli_run_file_mcp(arg_base + 1, mcp_ptr, mcp_len);
         };
     };
-    let cfg0 = mini_config_load();
+    let cfg0 = mini_config_load_with_profile(profile_ptr, profile_len);
     if cfg0.ok != true {
         println("scodex-mini: missing OPENAI_API_KEY");
         println("usage: scodex-mini <prompt>");

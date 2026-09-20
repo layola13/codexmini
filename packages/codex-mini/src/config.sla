@@ -10,6 +10,7 @@
 @import "jsonx.sa"
 @import "sa_std/fs.sa"
 @import "mcp.sla"
+@import "config_layers.sla"
 
 struct MiniConfig {
     api_key_ptr: ptr,
@@ -172,27 +173,83 @@ fn mini_config_path() -> (ptr, u64) {
 }
 
 fn mini_config_load() -> MiniConfig {
+    // Default: read profile from SCODEX_PROFILE env.
+    let (pp, pl) = mini_config_env_or(
+        STR_PTR("SCODEX_PROFILE"), STR_LEN("SCODEX_PROFILE"), PTR_NULL(), 0);
+    return mini_config_load_with_profile(pp, pl);
+}
+
+// mini_config_load_with_profile: layered TOML config (codex-style, our paths).
+// Layers: system -> user -> project -> profile. SCODEX_* env vars override
+// everything (highest precedence, backward compatible).
+fn mini_config_load_with_profile(profile_ptr: ptr, profile_len: u64) -> MiniConfig {
+    // 1. Load layered TOML config.
+    let entries = config_layers_merged(profile_ptr, profile_len);
+
+    // 2. Extract values from TOML layers (env vars override below).
+    let (tm_model_ptr, tm_model_len, tm_model_ok) = layer_get_str(entries,
+        STR_PTR("model"), STR_LEN("model"));
+    let (tm_mode_ptr, tm_mode_len, tm_mode_ok) = layer_get_str(entries,
+        STR_PTR("api_mode"), STR_LEN("api_mode"));
+    var tm_api_mode: u64;
+    tm_api_mode = 0;
+    if tm_mode_ok == true {
+        let is_chat = false;
+        X_STR_EQ(is_chat, tm_mode_ptr, tm_mode_len,
+            STR_PTR("chat"), STR_LEN("chat"));
+        if is_chat == true {
+            tm_api_mode = 1;
+        };
+    };
+    let (tm_base_ptr, tm_base_len, tm_base_ok) = layer_get_str(entries,
+        STR_PTR("base_url"), STR_LEN("base_url"));
+    let (tm_turns, tm_turns_ok) = layer_get_u64(entries,
+        STR_PTR("max_turns"), STR_LEN("max_turns"));
+
+    // 3. Env vars override TOML (backward compatible).
     let (key_ptr, key_len) = mini_config_env_or(STR_PTR("OPENAI_API_KEY"), STR_LEN("OPENAI_API_KEY"), PTR_NULL(), 0);
-    // SCODEX_API_MODE: "chat" for Chat Completions API, otherwise Responses API.
-    // Check first char: 'c' (99) for "chat".
     let (mode_ptr, mode_len) = mini_config_env_or(STR_PTR("SCODEX_API_MODE"), STR_LEN("SCODEX_API_MODE"), PTR_NULL(), 0);
     var api_mode: u64;
-    api_mode = 0;
+    api_mode = tm_api_mode;
     if mode_len == 4 {
-        // Simple check: assume "chat" if length is 4. Full string compare needs PTR_U8.
         api_mode = 1;
+    } else {
+        if mode_len > 0 {
+            api_mode = 0;
+        };
     };
     let servers = mini_config_load_mcp_servers();
-    // SCODEX_BASE_URL: override the API base URL (for testing/proxies).
-    let (base_ptr, base_len) = mini_config_env_or(
-        STR_PTR("SCODEX_BASE_URL"), STR_LEN("SCODEX_BASE_URL"),
-        STR_PTR("https://api.openai.com/v1"), STR_LEN("https://api.openai.com/v1")
-    );
-    // SCODEX_MODEL: override the model name.
-    let (model_ptr, model_len) = mini_config_env_or(
-        STR_PTR("SCODEX_MODEL"), STR_LEN("SCODEX_MODEL"),
-        STR_PTR("gpt-5"), STR_LEN("gpt-5")
-    );
+    let (env_base_ptr, env_base_len) = mini_config_env_or(
+        STR_PTR("SCODEX_BASE_URL"), STR_LEN("SCODEX_BASE_URL"), PTR_NULL(), 0);
+    let base_ptr: ptr = tm_base_ptr;
+    let base_len: u64 = tm_base_len;
+    if env_base_len > 0 {
+        base_ptr = env_base_ptr;
+        base_len = env_base_len;
+    } else {
+        if tm_base_ok == false {
+            base_ptr = STR_PTR("https://api.openai.com/v1");
+            base_len = STR_LEN("https://api.openai.com/v1");
+        };
+    };
+    let (env_model_ptr, env_model_len) = mini_config_env_or(
+        STR_PTR("SCODEX_MODEL"), STR_LEN("SCODEX_MODEL"), PTR_NULL(), 0);
+    let model_ptr: ptr = tm_model_ptr;
+    let model_len: u64 = tm_model_len;
+    if env_model_len > 0 {
+        model_ptr = env_model_ptr;
+        model_len = env_model_len;
+    } else {
+        if tm_model_ok == false {
+            model_ptr = STR_PTR("gpt-5");
+            model_len = STR_LEN("gpt-5");
+        };
+    };
+    var max_turns: u64;
+    max_turns = 8;
+    if tm_turns_ok == true {
+        max_turns = tm_turns;
+    };
     let cfg = MiniConfig {
         api_key_ptr: key_ptr,
         api_key_len: key_len,
@@ -200,7 +257,7 @@ fn mini_config_load() -> MiniConfig {
         model_len: model_len,
         base_url_ptr: base_ptr,
         base_url_len: base_len,
-        max_turns: 8,
+        max_turns: max_turns,
         api_mode: api_mode,
         mcp_servers: servers,
         ok: key_len != 0,

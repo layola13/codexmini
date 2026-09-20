@@ -1,0 +1,989 @@
+// toml.sla — pure-SLA TOML subset parser for scodex-mini config layers.
+//
+// Parses the TOML subset from docs/CONFIG_TOML_DESIGN.md into a flat
+// Vec<TomlEntry> with dotted keys. Every key/value is independently
+// heap-allocated (never aliases the input buffer).
+//
+// Supported: [table] / [a.b] headers, "basic" + 'literal' strings (with
+// \" \\ \n \t \r escapes), ints, floats (raw text), bools, ["a","b"]
+// string arrays (expanded to key.0, key.1, ...), one-level { k = "v" }
+// inline tables (expanded to key.k, ...), # comments, blank lines.
+// Unsupported (explicit error): [[array-of-tables]], nested arrays/tables,
+// \u escapes, datetimes, multiline strings, dotted bare keys.
+//
+// Failure mode: prints "scodex-mini: toml parse error at line N: <reason>"
+// and returns an empty Vec. Never panics.
+//
+// Codegen notes (2026-09-20, from the TUI spike):
+// - VEC_LEN / VEC_AS_PTR are not used at all in this file.
+// - X_COPY_BYTES has fixed internal labels: it appears textually at most
+//   once per function (only inside toml_buf_push / toml_buf_reserve).
+// - X_STR_EQ labels are parameterized by the out var: each use within one
+//   function gets a distinct out var name.
+// - `let` bindings may be reassigned; `var` for scalar loop counters.
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/vec.sa"
+@import "sa_std/core/slice.sa"
+@import "sa_std/io/print.sai"
+@import "slicex.sa"
+@import "sessionx.sa"
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+struct TomlEntry {
+    key_ptr: ptr, // dotted key, e.g. "profiles.fast.model" (heap)
+    key_len: u64,
+    val_ptr: ptr, // value bytes; strings are unescaped (heap)
+    val_len: u64,
+    val_kind: u64, // 0=string, 1=int, 2=float, 3=bool
+}
+
+// Value kinds.
+const TOML_STR: u64 = 0;
+const TOML_INT: u64 = 1;
+const TOML_FLOAT: u64 = 2;
+const TOML_BOOL: u64 = 3;
+
+// ---------------------------------------------------------------------------
+// Internal types
+// ---------------------------------------------------------------------------
+
+// Growable heap byte buffer.
+struct TomlBuf {
+    ptr: ptr,
+    len: u64,
+    cap: u64,
+}
+
+// Parser state, threaded by value.
+struct TomlState {
+    entries: Vec<TomlEntry>,
+    prefix_ptr: ptr, // current [table] dotted prefix (heap); empty = root
+    prefix_len: u64,
+    ok: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Byte helpers
+// ---------------------------------------------------------------------------
+
+fn toml_byte(p: ptr, i: u64) -> u64 {
+    let q = X_PTR_ADD(p, i);
+    return X_LOAD_U8(q);
+}
+
+fn toml_is_ws(b: u64) -> bool {
+    return b == 32 || b == 9 || b == 13;
+}
+
+fn toml_is_digit(b: u64) -> bool {
+    return b >= 48 && b <= 57;
+}
+
+fn toml_is_keychar(b: u64) -> bool {
+    // [A-Za-z0-9_-]
+    if b >= 48 && b <= 57 {
+        return true;
+    };
+    if b >= 65 && b <= 90 {
+        return true;
+    };
+    if b >= 97 && b <= 122 {
+        return true;
+    };
+    if b == 95 || b == 45 {
+        return true;
+    };
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Growable buffer
+// ---------------------------------------------------------------------------
+
+fn toml_buf_new(cap: u64) -> TomlBuf {
+    var c: u64;
+    c = cap;
+    if c < 64 {
+        c = 64;
+    };
+    return TomlBuf { ptr: X_HEAP_BUF_PTR(c), len: 0, cap: c };
+}
+
+fn toml_buf_reserve(b: TomlBuf, extra: u64) -> TomlBuf {
+    if b.len + extra <= b.cap {
+        return b;
+    };
+    var ncap: u64;
+    ncap = b.cap * 2;
+    let need = b.len + extra;
+    if ncap < need {
+        ncap = need;
+    };
+    let np = X_HEAP_BUF_PTR(ncap);
+    X_COPY_BYTES(np, b.ptr, b.len);
+    let mut nb = b;
+    nb.ptr = np;
+    nb.cap = ncap;
+    return nb;
+}
+
+fn toml_buf_push(b: TomlBuf, p: ptr, n: u64) -> TomlBuf {
+    let mut nb = toml_buf_reserve(b, n);
+    X_COPY_BYTES(X_PTR_ADD(nb.ptr, nb.len), p, n);
+    nb.len = nb.len + n;
+    return nb;
+}
+
+fn toml_buf_byte(b: TomlBuf, v: u64) -> TomlBuf {
+    let mut nb = toml_buf_reserve(b, 1);
+    X_STORE_U8(X_PTR_ADD(nb.ptr, nb.len), v);
+    nb.len = nb.len + 1;
+    return nb;
+}
+
+fn toml_buf_u64(b: TomlBuf, v: u64) -> TomlBuf {
+    let mut nb = b;
+    if v == 0 {
+        return toml_buf_byte(nb, 48);
+    };
+    var tmp: u64;
+    tmp = v;
+    var nd: u64;
+    nd = 0;
+    while tmp > 0 {
+        nd = nd + 1;
+        tmp = tmp / 10;
+    }
+    nb = toml_buf_reserve(nb, nd);
+    var i: u64;
+    i = nd;
+    tmp = v;
+    while tmp > 0 {
+        i = i - 1;
+        X_STORE_U8(X_PTR_ADD(nb.ptr, nb.len + i), 48 + (tmp % 10));
+        tmp = tmp / 10;
+    }
+    nb.len = nb.len + nd;
+    return nb;
+}
+
+// ---------------------------------------------------------------------------
+// State + errors
+// ---------------------------------------------------------------------------
+
+fn toml_state_new() -> TomlState {
+    let empty: Vec<TomlEntry> = Vec::new();
+    return TomlState {
+        entries: empty,
+        prefix_ptr: PTR_NULL(),
+        prefix_len: 0,
+        ok: true,
+    };
+}
+
+// Print "scodex-mini: toml parse error at line <n>: <msg>" and return a
+// failed state (accumulated entries are dropped; toml_parse maps this to an
+// empty Vec).
+fn toml_fail(line_no: u64, msg_ptr: ptr, msg_len: u64) -> TomlState {
+    sa_print_bytes(STR_PTR("scodex-mini: toml parse error at line "), STR_LEN("scodex-mini: toml parse error at line "));
+    let nb = toml_buf_u64(toml_buf_new(16), line_no);
+    // X_PRINT_BYTES carries the explicit & marker required for heap ptrs.
+    let pd = X_PRINT_BYTES(nb.ptr, nb.len);
+    sa_print_bytes(STR_PTR(": "), STR_LEN(": "));
+    sa_print_bytes(msg_ptr, msg_len);
+    sa_print_bytes(STR_PTR("\n"), 1);
+    let empty: Vec<TomlEntry> = Vec::new();
+    return TomlState {
+        entries: empty,
+        prefix_ptr: PTR_NULL(),
+        prefix_len: 0,
+        ok: false,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Key building
+// ---------------------------------------------------------------------------
+
+// Build "prefix.k1" or "prefix.k1.k2" (prefix/k2 omitted when empty) as a
+// fresh heap buffer.
+fn toml_key3(prefix_ptr: ptr, prefix_len: u64, k1_ptr: ptr, k1_len: u64, k2_ptr: ptr, k2_len: u64) -> TomlBuf {
+    let mut b = toml_buf_new(prefix_len + 1 + k1_len + 1 + k2_len);
+    if prefix_len > 0 {
+        b = toml_buf_push(b, prefix_ptr, prefix_len);
+        b = toml_buf_byte(b, 46);
+    };
+    b = toml_buf_push(b, k1_ptr, k1_len);
+    if k2_len > 0 {
+        b = toml_buf_byte(b, 46);
+        b = toml_buf_push(b, k2_ptr, k2_len);
+    };
+    return b;
+}
+
+// Emit one entry. The value buffer is taken over as-is (no copy); the key
+// is built fresh on the heap.
+fn toml_emit(st: TomlState, key_ptr: ptr, key_len: u64, vb: TomlBuf, kind: u64) -> TomlState {
+    let kb = toml_key3(st.prefix_ptr, st.prefix_len, key_ptr, key_len, PTR_NULL(), 0);
+    let e = TomlEntry {
+        key_ptr: kb.ptr,
+        key_len: kb.len,
+        val_ptr: vb.ptr,
+        val_len: vb.len,
+        val_kind: kind,
+    };
+    let mut ns = st;
+    ns.entries.push(e);
+    return ns;
+}
+
+// ---------------------------------------------------------------------------
+// Small scanners
+// ---------------------------------------------------------------------------
+
+// Strip leading/trailing ASCII ws (space, tab, CR). Result aliases input.
+fn toml_trim(p: ptr, n: u64) -> (ptr, u64) {
+    var s: u64;
+    s = 0;
+    while s < n && toml_is_ws(toml_byte(p, s)) {
+        s = s + 1;
+    }
+    var e: u64;
+    e = n;
+    while e > s && toml_is_ws(toml_byte(p, e - 1)) {
+        e = e - 1;
+    }
+    return (X_PTR_ADD(p, s), e - s);
+}
+
+// Validate a dotted table name: keychar(.keychar)*, no empty segments.
+fn toml_valid_dotted(p: ptr, n: u64) -> bool {
+    var i: u64;
+    i = 0;
+    var seg_len: u64;
+    seg_len = 0;
+    while i < n {
+        let b = toml_byte(p, i);
+        if b == 46 {
+            if seg_len == 0 {
+                return false;
+            };
+            seg_len = 0;
+        } else if toml_is_keychar(b) {
+            seg_len = seg_len + 1;
+        } else {
+            return false;
+        };
+        i = i + 1;
+    }
+    if seg_len == 0 {
+        return false;
+    };
+    return true;
+}
+
+// Scan a basic "..." string at p[k] (p[k] == '"'). Unescapes \" \\ \n \t
+// \r into a heap buffer. Returns (buf, next_i, ok).
+fn toml_scan_basic(p: ptr, n: u64, k: u64) -> (TomlBuf, u64, bool) {
+    let mut b = toml_buf_new(n - k);
+    var i: u64;
+    i = k + 1;
+    while i < n {
+        let c = toml_byte(p, i);
+        if c == 34 {
+            return (b, i + 1, true);
+        };
+        if c == 92 {
+            i = i + 1;
+            if i >= n {
+                return (toml_buf_new(0), i, false);
+            };
+            let e = toml_byte(p, i);
+            if e == 34 {
+                b = toml_buf_byte(b, 34);
+            } else if e == 92 {
+                b = toml_buf_byte(b, 92);
+            } else if e == 110 {
+                b = toml_buf_byte(b, 10);
+            } else if e == 116 {
+                b = toml_buf_byte(b, 9);
+            } else if e == 114 {
+                b = toml_buf_byte(b, 13);
+            } else {
+                return (toml_buf_new(0), i, false);
+            };
+            i = i + 1;
+        } else if c == 10 {
+            // raw newline inside a single-line string
+            return (toml_buf_new(0), i, false);
+        } else {
+            b = toml_buf_byte(b, c);
+            i = i + 1;
+        };
+    }
+    return (toml_buf_new(0), i, false);
+}
+
+// Scan a literal '...' string at p[k] (p[k] == '\''). No escapes.
+// Returns (buf, next_i, ok).
+fn toml_scan_literal(p: ptr, n: u64, k: u64) -> (TomlBuf, u64, bool) {
+    var i: u64;
+    i = k + 1;
+    while i < n && toml_byte(p, i) != 39 {
+        i = i + 1;
+    }
+    if i >= n {
+        return (toml_buf_new(0), i, false);
+    };
+    let b = toml_buf_push(toml_buf_new(i - k - 1), X_PTR_ADD(p, k + 1), i - k - 1);
+    return (b, i + 1, true);
+}
+
+// Parse a string (basic or literal) at p[i]. Returns (buf, next_i, ok).
+fn toml_parse_string_only(p: ptr, n: u64, i: u64) -> (TomlBuf, u64, bool) {
+    let c = toml_byte(p, i);
+    if c == 34 {
+        return toml_scan_basic(p, n, i);
+    };
+    if c == 39 {
+        return toml_scan_literal(p, n, i);
+    };
+    return (toml_buf_new(0), i, false);
+}
+
+// Scan [-]digits[.digits] at p[m] (m < n). Stores raw text.
+// Returns (buf, kind, next_i, ok).
+fn toml_scan_number(p: ptr, n: u64, m: u64) -> (TomlBuf, u64, u64, bool) {
+    var i: u64;
+    i = m;
+    if toml_byte(p, i) == 45 {
+        i = i + 1;
+    };
+    if i >= n || toml_is_digit(toml_byte(p, i)) == false {
+        return (toml_buf_new(0), 0, m, false);
+    };
+    while i < n && toml_is_digit(toml_byte(p, i)) {
+        i = i + 1;
+    }
+    var kind: u64;
+    kind = TOML_INT;
+    if i < n && toml_byte(p, i) == 46 {
+        if i + 1 >= n || toml_is_digit(toml_byte(p, i + 1)) == false {
+            return (toml_buf_new(0), 0, m, false);
+        };
+        kind = TOML_FLOAT;
+        i = i + 1;
+        while i < n && toml_is_digit(toml_byte(p, i)) {
+            i = i + 1;
+        }
+    };
+    let vb = toml_buf_push(toml_buf_new(i - m), X_PTR_ADD(p, m), i - m);
+    return (vb, kind, i, true);
+}
+
+// Parse a scalar (string / number / bool) at p[m] (m < n). No arrays or
+// inline tables. Returns (buf, kind, next_i, ok); buf is heap-allocated.
+fn toml_parse_scalar(p: ptr, n: u64, m: u64) -> (TomlBuf, u64, u64, bool) {
+    let c = toml_byte(p, m);
+    if c == 34 || c == 39 {
+        let (sb, ni, sok) = toml_parse_string_only(p, n, m);
+        return (sb, TOML_STR, ni, sok);
+    };
+    if c == 116 {
+        // "true"
+        if m + 4 > n {
+            return (toml_buf_new(0), 0, m, false);
+        };
+        let mt = false;
+        X_STR_EQ(mt, X_PTR_ADD(p, m), 4, STR_PTR("true"), STR_LEN("true"));
+        if mt == false {
+            return (toml_buf_new(0), 0, m, false);
+        };
+        let vb = toml_buf_push(toml_buf_new(4), X_PTR_ADD(p, m), 4);
+        return (vb, TOML_BOOL, m + 4, true);
+    };
+    if c == 102 {
+        // "false"
+        if m + 5 > n {
+            return (toml_buf_new(0), 0, m, false);
+        };
+        let mf = false;
+        X_STR_EQ(mf, X_PTR_ADD(p, m), 5, STR_PTR("false"), STR_LEN("false"));
+        if mf == false {
+            return (toml_buf_new(0), 0, m, false);
+        };
+        let vb = toml_buf_push(toml_buf_new(5), X_PTR_ADD(p, m), 5);
+        return (vb, TOML_BOOL, m + 5, true);
+    };
+    if c == 45 || toml_is_digit(c) {
+        return toml_scan_number(p, n, m);
+    };
+    return (toml_buf_new(0), 0, m, false);
+}
+
+// ---------------------------------------------------------------------------
+// Value parsers
+// ---------------------------------------------------------------------------
+
+// Parse ["a", "b"] at p[k] (p[k] == '['). String elements only (v1).
+// Emits key.0, key.1, ... Returns (state, next_i).
+fn toml_value_array(st: TomlState, p: ptr, n: u64, key_ptr: ptr, key_len: u64, k: u64, line_no: u64) -> (TomlState, u64) {
+    let mut ns = st;
+    var i: u64;
+    i = k + 1;
+    var idx: u64;
+    idx = 0;
+    var expect_val: u64;
+    expect_val = 1;
+    var done: u64;
+    done = 0;
+    while done == 0 {
+        while i < n && toml_is_ws(toml_byte(p, i)) {
+            i = i + 1;
+        }
+        if i >= n {
+            let fs = toml_fail(line_no, STR_PTR("unterminated array"), STR_LEN("unterminated array"));
+            return (fs, i);
+        };
+        let c = toml_byte(p, i);
+        if c == 93 {
+            i = i + 1;
+            done = 1;
+        } else if expect_val == 1 && (c == 34 || c == 39) {
+            let (sb, ni, sok) = toml_parse_string_only(p, n, i);
+            if sok == false {
+                let fs = toml_fail(line_no, STR_PTR("bad string in array"), STR_LEN("bad string in array"));
+                return (fs, i);
+            };
+            // key: prefix.key.idx
+            let mut kb = toml_key3(ns.prefix_ptr, ns.prefix_len, key_ptr, key_len, PTR_NULL(), 0);
+            kb = toml_buf_byte(kb, 46);
+            kb = toml_buf_u64(kb, idx);
+            let e = TomlEntry {
+                key_ptr: kb.ptr,
+                key_len: kb.len,
+                val_ptr: sb.ptr,
+                val_len: sb.len,
+                val_kind: TOML_STR,
+            };
+            ns.entries.push(e);
+            idx = idx + 1;
+            expect_val = 0;
+            i = ni;
+        } else if expect_val == 0 && c == 44 {
+            expect_val = 1;
+            i = i + 1;
+        } else {
+            let fs = toml_fail(line_no, STR_PTR("invalid array"), STR_LEN("invalid array"));
+            return (fs, i);
+        };
+    }
+    return (ns, i);
+}
+
+// Parse { a = "b", c = "d" } at p[k] (p[k] == '{'). One level only; values
+// are scalars (no nesting). Emits key.a, key.c, ... Returns (state, next_i).
+fn toml_value_inline_table(st: TomlState, p: ptr, n: u64, key_ptr: ptr, key_len: u64, k: u64, line_no: u64) -> (TomlState, u64) {
+    let mut ns = st;
+    var i: u64;
+    i = k + 1;
+    var expect_kv: u64;
+    expect_kv = 1;
+    var done: u64;
+    done = 0;
+    while done == 0 {
+        while i < n && toml_is_ws(toml_byte(p, i)) {
+            i = i + 1;
+        }
+        if i >= n {
+            let fs = toml_fail(line_no, STR_PTR("unterminated inline table"), STR_LEN("unterminated inline table"));
+            return (fs, i);
+        };
+        let c = toml_byte(p, i);
+        if c == 125 {
+            i = i + 1;
+            done = 1;
+        } else if expect_kv == 1 && toml_is_keychar(c) {
+            var j: u64;
+            j = i;
+            while j < n && toml_is_keychar(toml_byte(p, j)) {
+                j = j + 1;
+            }
+            let sk_ptr = X_PTR_ADD(p, i);
+            let sk_len = j - i;
+            var m: u64;
+            m = j;
+            while m < n && toml_is_ws(toml_byte(p, m)) {
+                m = m + 1;
+            }
+            if m >= n || toml_byte(p, m) != 61 {
+                let fs = toml_fail(line_no, STR_PTR("expected '=' in inline table"), STR_LEN("expected '=' in inline table"));
+                return (fs, m);
+            };
+            m = m + 1;
+            while m < n && toml_is_ws(toml_byte(p, m)) {
+                m = m + 1;
+            }
+            if m >= n {
+                let fs = toml_fail(line_no, STR_PTR("expected value in inline table"), STR_LEN("expected value in inline table"));
+                return (fs, m);
+            };
+            let vc = toml_byte(p, m);
+            if vc == 91 || vc == 123 {
+                let fs = toml_fail(line_no, STR_PTR("nested tables not supported"), STR_LEN("nested tables not supported"));
+                return (fs, m);
+            };
+            let (svb, skind, sni, sok) = toml_parse_scalar(p, n, m);
+            if sok == false {
+                let fs = toml_fail(line_no, STR_PTR("bad value in inline table"), STR_LEN("bad value in inline table"));
+                return (fs, m);
+            };
+            // key: prefix.key.subkey
+            let kb = toml_key3(ns.prefix_ptr, ns.prefix_len, key_ptr, key_len, sk_ptr, sk_len);
+            let e = TomlEntry {
+                key_ptr: kb.ptr,
+                key_len: kb.len,
+                val_ptr: svb.ptr,
+                val_len: svb.len,
+                val_kind: skind,
+            };
+            ns.entries.push(e);
+            i = sni;
+            expect_kv = 0;
+        } else if expect_kv == 0 && c == 44 {
+            expect_kv = 1;
+            i = i + 1;
+        } else {
+            let fs = toml_fail(line_no, STR_PTR("invalid inline table"), STR_LEN("invalid inline table"));
+            return (fs, i);
+        };
+    }
+    return (ns, i);
+}
+
+// Parse a value at p[k] (k < n) for key (key_ptr, key_len).
+// Returns (state, next_i) where next_i is just past the value.
+fn toml_parse_value(st: TomlState, p: ptr, n: u64, key_ptr: ptr, key_len: u64, k: u64, line_no: u64) -> (TomlState, u64) {
+    if k >= n {
+        let fs = toml_fail(line_no, STR_PTR("expected value"), STR_LEN("expected value"));
+        return (fs, k);
+    };
+    let c = toml_byte(p, k);
+    if c == 91 {
+        return toml_value_array(st, p, n, key_ptr, key_len, k, line_no);
+    };
+    if c == 123 {
+        return toml_value_inline_table(st, p, n, key_ptr, key_len, k, line_no);
+    };
+    let (svb, skind, sni, sok) = toml_parse_scalar(p, n, k);
+    if sok == false {
+        let fs = toml_fail(line_no, STR_PTR("invalid value"), STR_LEN("invalid value"));
+        return (fs, k);
+    };
+    let ns = toml_emit(st, key_ptr, key_len, svb, skind);
+    return (ns, sni);
+}
+
+// ---------------------------------------------------------------------------
+// Line parsers
+// ---------------------------------------------------------------------------
+
+// Parse "[a.b]" with p[i] == '['. Sets the table prefix.
+fn toml_table_header(st: TomlState, p: ptr, n: u64, i: u64, line_no: u64) -> TomlState {
+    var j: u64;
+    j = i + 1;
+    while j < n && toml_byte(p, j) != 93 {
+        j = j + 1;
+    }
+    if j >= n {
+        return toml_fail(line_no, STR_PTR("unterminated table header"), STR_LEN("unterminated table header"));
+    };
+    let (ip, ilen) = toml_trim(X_PTR_ADD(p, i + 1), j - i - 1);
+    if ilen == 0 {
+        return toml_fail(line_no, STR_PTR("empty table header"), STR_LEN("empty table header"));
+    };
+    if toml_valid_dotted(ip, ilen) == false {
+        return toml_fail(line_no, STR_PTR("invalid table name"), STR_LEN("invalid table name"));
+    };
+    // After ']' only whitespace or a comment may follow.
+    var k: u64;
+    k = j + 1;
+    while k < n && toml_is_ws(toml_byte(p, k)) {
+        k = k + 1;
+    }
+    if k < n && toml_byte(p, k) != 35 {
+        return toml_fail(line_no, STR_PTR("unexpected text after table header"), STR_LEN("unexpected text after table header"));
+    };
+    let npb = toml_buf_push(toml_buf_new(ilen), ip, ilen);
+    let mut ns = st;
+    ns.prefix_ptr = npb.ptr;
+    ns.prefix_len = npb.len;
+    return ns;
+}
+
+// Parse "key = value" with p[i] at the start of the key.
+fn toml_key_value(st: TomlState, p: ptr, n: u64, i: u64, line_no: u64) -> TomlState {
+    var j: u64;
+    j = i;
+    while j < n && toml_is_keychar(toml_byte(p, j)) {
+        j = j + 1;
+    }
+    if j == i {
+        return toml_fail(line_no, STR_PTR("expected key"), STR_LEN("expected key"));
+    };
+    let key_ptr = X_PTR_ADD(p, i);
+    let key_len = j - i;
+    var k: u64;
+    k = j;
+    while k < n && toml_is_ws(toml_byte(p, k)) {
+        k = k + 1;
+    }
+    if k >= n || toml_byte(p, k) != 61 {
+        return toml_fail(line_no, STR_PTR("expected '=' after key"), STR_LEN("expected '=' after key"));
+    };
+    k = k + 1;
+    while k < n && toml_is_ws(toml_byte(p, k)) {
+        k = k + 1;
+    }
+    let (ns, end_pos) = toml_parse_value(st, p, n, key_ptr, key_len, k, line_no);
+    if ns.ok == false {
+        return ns;
+    };
+    // After the value only whitespace or a comment may follow.
+    var t: u64;
+    t = end_pos;
+    while t < n && toml_is_ws(toml_byte(p, t)) {
+        t = t + 1;
+    }
+    if t < n && toml_byte(p, t) != 35 {
+        return toml_fail(line_no, STR_PTR("unexpected text after value"), STR_LEN("unexpected text after value"));
+    };
+    return ns;
+}
+
+// Parse one line (no trailing newline; trailing CR already stripped).
+fn toml_parse_line(st: TomlState, p: ptr, n: u64, line_no: u64) -> TomlState {
+    var i: u64;
+    i = 0;
+    while i < n && toml_is_ws(toml_byte(p, i)) {
+        i = i + 1;
+    }
+    if i >= n {
+        return st;
+    };
+    let c = toml_byte(p, i);
+    if c == 35 {
+        return st;
+    };
+    if c == 91 {
+        return toml_table_header(st, p, n, i, line_no);
+    };
+    return toml_key_value(st, p, n, i, line_no);
+}
+
+// ---------------------------------------------------------------------------
+// Public entry point
+// ---------------------------------------------------------------------------
+
+// Parse the TOML subset. Returns flat TomlEntry list, or an empty Vec on
+// any parse error (error printed, no panic).
+fn toml_parse(src_ptr: ptr, src_len: u64) -> Vec<TomlEntry> {
+    let mut st = toml_state_new();
+    var pos: u64;
+    pos = 0;
+    var line_no: u64;
+    line_no = 1;
+    while pos < src_len {
+        var eol: u64;
+        eol = pos;
+        while eol < src_len && toml_byte(src_ptr, eol) != 10 {
+            eol = eol + 1;
+        }
+        var llen: u64;
+        llen = eol - pos;
+        if llen > 0 && toml_byte(src_ptr, eol - 1) == 13 {
+            llen = llen - 1;
+        };
+        let lp = X_PTR_ADD(src_ptr, pos);
+        st = toml_parse_line(st, lp, llen, line_no);
+        if st.ok == false {
+            let empty: Vec<TomlEntry> = Vec::new();
+            return empty;
+        };
+        pos = eol + 1;
+        line_no = line_no + 1;
+    }
+    return st.entries;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+// Find an entry by dotted key. Returns (entry, found).
+fn toml_test_find(entries: Vec<TomlEntry>, key_ptr: ptr, key_len: u64) -> (TomlEntry, bool) {
+    let n = entries.len();
+    var i: u64;
+    i = 0;
+    while i < n {
+        let e = entries.get(i);
+        let eq = false;
+        X_STR_EQ(eq, e.key_ptr, e.key_len, key_ptr, key_len);
+        if eq == true {
+            return (e, true);
+        };
+        i = i + 1;
+    }
+    let dummy = TomlEntry {
+        key_ptr: PTR_NULL(),
+        key_len: 0,
+        val_ptr: PTR_NULL(),
+        val_len: 0,
+        val_kind: 0,
+    };
+    return (dummy, false);
+}
+
+// Assert entry holds the expected string value.
+fn toml_test_check_str(e: TomlEntry, want_ptr: ptr, want_len: u64, want_kind: u64, code: u64) {
+    if e.val_kind != want_kind {
+        panic(code);
+    };
+    let ceq = false;
+    X_STR_EQ(ceq, e.val_ptr, e.val_len, want_ptr, want_len);
+    if ceq == false {
+        panic(code + 500);
+    };
+}
+
+@test "toml basic key=value"() {
+    let entries = toml_parse(
+        STR_PTR("model = \"gpt-5\"\nmax_turns = 8\nneg = -45\nratio = 12.5\nflag = true\noff = false\nlit = 'raw'\n"),
+        STR_LEN("model = \"gpt-5\"\nmax_turns = 8\nneg = -45\nratio = 12.5\nflag = true\noff = false\nlit = 'raw'\n"));
+    if entries.len() != 7 {
+        panic(1);
+    };
+    let (e1, f1) = toml_test_find(entries, STR_PTR("model"), STR_LEN("model"));
+    if f1 == false {
+        panic(2);
+    };
+    toml_test_check_str(e1, STR_PTR("gpt-5"), STR_LEN("gpt-5"), TOML_STR, 3);
+    let (e2, f2) = toml_test_find(entries, STR_PTR("max_turns"), STR_LEN("max_turns"));
+    if f2 == false {
+        panic(4);
+    };
+    toml_test_check_str(e2, STR_PTR("8"), STR_LEN("8"), TOML_INT, 5);
+    let (e3, f3) = toml_test_find(entries, STR_PTR("neg"), STR_LEN("neg"));
+    if f3 == false {
+        panic(6);
+    };
+    toml_test_check_str(e3, STR_PTR("-45"), STR_LEN("-45"), TOML_INT, 7);
+    let (e4, f4) = toml_test_find(entries, STR_PTR("ratio"), STR_LEN("ratio"));
+    if f4 == false {
+        panic(8);
+    };
+    toml_test_check_str(e4, STR_PTR("12.5"), STR_LEN("12.5"), TOML_FLOAT, 9);
+    let (e5, f5) = toml_test_find(entries, STR_PTR("flag"), STR_LEN("flag"));
+    if f5 == false {
+        panic(10);
+    };
+    toml_test_check_str(e5, STR_PTR("true"), STR_LEN("true"), TOML_BOOL, 11);
+    let (e6, f6) = toml_test_find(entries, STR_PTR("off"), STR_LEN("off"));
+    if f6 == false {
+        panic(12);
+    };
+    toml_test_check_str(e6, STR_PTR("false"), STR_LEN("false"), TOML_BOOL, 13);
+    let (e7, f7) = toml_test_find(entries, STR_PTR("lit"), STR_LEN("lit"));
+    if f7 == false {
+        panic(14);
+    };
+    toml_test_check_str(e7, STR_PTR("raw"), STR_LEN("raw"), TOML_STR, 15);
+}
+
+@test "toml table prefix"() {
+    let entries = toml_parse(
+        STR_PTR("[sandbox]\nenabled = true\n"),
+        STR_LEN("[sandbox]\nenabled = true\n"));
+    if entries.len() != 1 {
+        panic(21);
+    };
+    let (e, found) = toml_test_find(entries, STR_PTR("sandbox.enabled"), STR_LEN("sandbox.enabled"));
+    if found == false {
+        panic(22);
+    };
+    toml_test_check_str(e, STR_PTR("true"), STR_LEN("true"), TOML_BOOL, 23);
+}
+
+@test "toml nested table prefix"() {
+    let entries = toml_parse(
+        STR_PTR("[a.b]\nk = \"v\"\n[profiles.fast]\nmodel = \"gpt-5-mini\"\n"),
+        STR_LEN("[a.b]\nk = \"v\"\n[profiles.fast]\nmodel = \"gpt-5-mini\"\n"));
+    if entries.len() != 2 {
+        panic(31);
+    };
+    let (e1, f1) = toml_test_find(entries, STR_PTR("a.b.k"), STR_LEN("a.b.k"));
+    if f1 == false {
+        panic(32);
+    };
+    toml_test_check_str(e1, STR_PTR("v"), STR_LEN("v"), TOML_STR, 33);
+    let (e2, f2) = toml_test_find(entries, STR_PTR("profiles.fast.model"), STR_LEN("profiles.fast.model"));
+    if f2 == false {
+        panic(34);
+    };
+    toml_test_check_str(e2, STR_PTR("gpt-5-mini"), STR_LEN("gpt-5-mini"), TOML_STR, 35);
+}
+
+@test "toml escape sequences"() {
+    // TOML source: s = "a\nb\t\"c\\d\re"
+    let entries = toml_parse(
+        STR_PTR("s = \"a\\nb\\t\\\"c\\\\d\\re\"\n"),
+        STR_LEN("s = \"a\\nb\\t\\\"c\\\\d\\re\"\n"));
+    if entries.len() != 1 {
+        panic(41);
+    };
+    let (e, found) = toml_test_find(entries, STR_PTR("s"), STR_LEN("s"));
+    if found == false {
+        panic(42);
+    };
+    if e.val_kind != TOML_STR {
+        panic(43);
+    };
+    // expected bytes: a \n b \t " c \ d \r e  (10 bytes)
+    if e.val_len != 10 {
+        panic(44);
+    };
+    if toml_byte(e.val_ptr, 0) != 97 {
+        panic(45);
+    };
+    if toml_byte(e.val_ptr, 1) != 10 {
+        panic(46);
+    };
+    if toml_byte(e.val_ptr, 2) != 98 {
+        panic(47);
+    };
+    if toml_byte(e.val_ptr, 3) != 9 {
+        panic(48);
+    };
+    if toml_byte(e.val_ptr, 4) != 34 {
+        panic(49);
+    };
+    if toml_byte(e.val_ptr, 5) != 99 {
+        panic(50);
+    };
+    if toml_byte(e.val_ptr, 6) != 92 {
+        panic(51);
+    };
+    if toml_byte(e.val_ptr, 7) != 100 {
+        panic(52);
+    };
+    if toml_byte(e.val_ptr, 8) != 13 {
+        panic(53);
+    };
+    if toml_byte(e.val_ptr, 9) != 101 {
+        panic(54);
+    };
+}
+
+@test "toml array expansion"() {
+    let entries = toml_parse(
+        STR_PTR("args = [\"a\", \"b\"]\nempty = []\n"),
+        STR_LEN("args = [\"a\", \"b\"]\nempty = []\n"));
+    if entries.len() != 2 {
+        panic(61);
+    };
+    let (e0, f0) = toml_test_find(entries, STR_PTR("args.0"), STR_LEN("args.0"));
+    if f0 == false {
+        panic(62);
+    };
+    toml_test_check_str(e0, STR_PTR("a"), STR_LEN("a"), TOML_STR, 63);
+    let (e1, f1) = toml_test_find(entries, STR_PTR("args.1"), STR_LEN("args.1"));
+    if f1 == false {
+        panic(64);
+    };
+    toml_test_check_str(e1, STR_PTR("b"), STR_LEN("b"), TOML_STR, 65);
+}
+
+@test "toml inline table expansion"() {
+    let entries = toml_parse(
+        STR_PTR("env = { FOO = \"bar\", N = 42 }\n"),
+        STR_LEN("env = { FOO = \"bar\", N = 42 }\n"));
+    if entries.len() != 2 {
+        panic(71);
+    };
+    let (e1, f1) = toml_test_find(entries, STR_PTR("env.FOO"), STR_LEN("env.FOO"));
+    if f1 == false {
+        panic(72);
+    };
+    toml_test_check_str(e1, STR_PTR("bar"), STR_LEN("bar"), TOML_STR, 73);
+    let (e2, f2) = toml_test_find(entries, STR_PTR("env.N"), STR_LEN("env.N"));
+    if f2 == false {
+        panic(74);
+    };
+    toml_test_check_str(e2, STR_PTR("42"), STR_LEN("42"), TOML_INT, 75);
+}
+
+@test "toml comments ignored"() {
+    let entries = toml_parse(
+        STR_PTR("# full line comment\nk = \"v\" # trailing comment\ns = \"a#b\" # hash in string\n   # indented\n"),
+        STR_LEN("# full line comment\nk = \"v\" # trailing comment\ns = \"a#b\" # hash in string\n   # indented\n"));
+    if entries.len() != 2 {
+        panic(81);
+    };
+    let (e1, f1) = toml_test_find(entries, STR_PTR("k"), STR_LEN("k"));
+    if f1 == false {
+        panic(82);
+    };
+    toml_test_check_str(e1, STR_PTR("v"), STR_LEN("v"), TOML_STR, 83);
+    let (e2, f2) = toml_test_find(entries, STR_PTR("s"), STR_LEN("s"));
+    if f2 == false {
+        panic(84);
+    };
+    toml_test_check_str(e2, STR_PTR("a#b"), STR_LEN("a#b"), TOML_STR, 85);
+}
+
+@test "toml invalid returns empty"() {
+    // missing value
+    let b1 = toml_parse(STR_PTR("k = \n"), STR_LEN("k = \n"));
+    if b1.len() != 0 {
+        panic(91);
+    };
+    // unterminated table header
+    let b2 = toml_parse(STR_PTR("[unclosed\n"), STR_LEN("[unclosed\n"));
+    if b2.len() != 0 {
+        panic(92);
+    };
+    // unterminated string
+    let b3 = toml_parse(STR_PTR("k = \"oops\n"), STR_LEN("k = \"oops\n"));
+    if b3.len() != 0 {
+        panic(93);
+    };
+    // missing '='
+    let b4 = toml_parse(STR_PTR("k \"v\"\n"), STR_LEN("k \"v\"\n"));
+    if b4.len() != 0 {
+        panic(94);
+    };
+    // bad escape
+    let b5 = toml_parse(STR_PTR("k = \"\\q\"\n"), STR_LEN("k = \"\\q\"\n"));
+    if b5.len() != 0 {
+        panic(95);
+    };
+    // [[array]] not supported
+    let b6 = toml_parse(STR_PTR("[[a]]\n"), STR_LEN("[[a]]\n"));
+    if b6.len() != 0 {
+        panic(96);
+    };
+    // trailing junk after value
+    let b7 = toml_parse(STR_PTR("k = \"v\" junk\n"), STR_LEN("k = \"v\" junk\n"));
+    if b7.len() != 0 {
+        panic(97);
+    };
+    // unterminated array
+    let b8 = toml_parse(STR_PTR("k = [\"a\"\n"), STR_LEN("k = [\"a\"\n"));
+    if b8.len() != 0 {
+        panic(98);
+    };
+}

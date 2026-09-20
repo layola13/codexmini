@@ -1,0 +1,26 @@
+// SA-facing ABI for the TOML parser plugin.
+//
+// Subset parser aligned with scodex-mini's pure-SLA toml.sla:
+//   [table] / [a.b.c] headers, dotted keys, basic strings (escapes),
+//   literal strings, ints, floats, bools, single-line arrays (expanded to
+//   key.0/key.1/...), single-line one-level inline tables (expanded to
+//   key.sub). Duplicate keys: last wins.
+//
+// Memory model: sa_toml_parse copies the input into plugin-owned memory and
+// returns a doc handle (u64). 0 means parse failure (or no free slot).
+// All key/value slices returned by sa_toml_entry_get point into that owned
+// memory and stay valid until sa_toml_free.
+//
+// val_kind: 0=string (escapes resolved), 1=int, 2=float, 3=bool.
+// int/float values are the original decimal text.
+//
+// sa_toml_entry_get status codes (u32 return):
+//   0  ok
+//   1  bad handle
+//   2  index out of range
+// sa_toml_free returns 0 on success (1 on bad handle, still safe to call).
+
+@extern sa_toml_parse(&data: ptr, data_len: u64) -> u64
+@extern sa_toml_entry_count(handle: u64) -> u64
+@extern sa_toml_entry_get(handle: u64, index: u64, &out_key_ptr: ptr, &out_key_len: ptr, &out_val_ptr: ptr, &out_val_len: ptr, &out_kind: ptr) -> u32
+@extern sa_toml_free(handle: u64) -> u32

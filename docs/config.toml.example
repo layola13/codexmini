@@ -1,0 +1,36 @@
+# scodex-mini 配置示例
+# 位置：~/.scodex-mini/config.toml（或 $SCODEX_HOME/config.toml）
+# 分层：system (/etc/scodex-mini/config.toml) → user (本文件)
+#       → project (./.scodex-mini/config.toml) → profile → SCODEX_* 环境变量
+
+# 默认模型
+model = "gpt-5"
+
+# API 模式：responses（默认）| chat
+api_mode = "responses"
+
+# API base URL（测试/代理用）
+# base_url = "https://api.openai.com/v1"
+
+# 最大 turn 数
+max_turns = 8
+
+# 上下文压缩
+[compaction]
+budget = 32000
+disabled = false
+
+# MCP 服务器
+[mcp_servers.my-server]
+command = "npx"
+args = ["-y", "my-mcp-server"]
+env = { FOO = "bar" }
+
+# Profiles：--profile <name> 或 SCODEX_PROFILE=<name> 选用
+[profiles.fast]
+model = "gpt-5-mini"
+api_mode = "chat"
+
+[profiles.coding]
+model = "gpt-5"
+max_turns = 16

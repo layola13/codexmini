@@ -1,0 +1,64 @@
+// toml_plugin.sla — TOML parser via sa_plugin_toml (Zig).
+//
+// Drop-in replacement for toml.sla (pure SLA). Same API:
+//   struct TomlEntry { key_ptr, key_len, val_ptr, val_len, val_kind }
+//   fn toml_parse(src_ptr: ptr, src_len: u64) -> Vec<TomlEntry>
+//
+// Memory: entry key/val bytes are copied to SLA-owned heap before the
+// plugin handle is freed, so returned pointers stay valid for the
+// process lifetime (same one-shot leak model as toml.sla).
+
+@import "plugin_abi/sa_toml.sai"
+@import "sa_std/vec.sa"
+@import "slicex.sa"
+@import "sessionx.sa"
+
+struct TomlEntry {
+    key_ptr: ptr,
+    key_len: u64,
+    val_ptr: ptr,
+    val_len: u64,
+    val_kind: u64,
+}
+
+// Single X_COPY_BYTES wrapper (avoids fixed-label conflicts).
+fn toml_pl_copy(dest: ptr, src: ptr, len: u64) {
+    X_COPY_BYTES(dest, src, len);
+}
+
+fn toml_parse(src_ptr: ptr, src_len: u64) -> Vec<TomlEntry> {
+    let result: Vec<TomlEntry> = Vec::new();
+    let handle = sa_toml_parse(src_ptr, src_len);
+    if handle == 0 {
+        return result;
+    };
+    let count = sa_toml_entry_count(handle);
+    let i: u64 = 0;
+    while i < count {
+        let kptr: ptr = PTR_NULL();
+        let klen: u64 = 0;
+        let vptr: ptr = PTR_NULL();
+        let vlen: u64 = 0;
+        let vkind: u64 = 0;
+        let st = sa_toml_entry_get(handle, i,
+            &kptr, &klen, &vptr, &vlen, &vkind);
+        if st == 0 {
+            // Copy to SLA-owned heap; plugin memory is freed below.
+            let nk = X_HEAP_BUF_PTR(klen);
+            toml_pl_copy(nk, kptr, klen);
+            let nv = X_HEAP_BUF_PTR(vlen);
+            toml_pl_copy(nv, vptr, vlen);
+            let e = TomlEntry {
+                key_ptr: nk,
+                key_len: klen,
+                val_ptr: nv,
+                val_len: vlen,
+                val_kind: vkind,
+            };
+            result.push(e);
+        };
+        i = i + 1;
+    };
+    sa_toml_free(handle);
+    return result;
+}

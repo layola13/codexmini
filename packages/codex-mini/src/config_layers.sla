@@ -1,0 +1,380 @@
+// config_layers.sla — layered TOML config (codex-style, our own paths).
+//
+// Layers (later overrides earlier, per-key):
+//   1. system:  /etc/scodex-mini/config.toml
+//   2. user:    $SCODEX_HOME/config.toml (default ~/.scodex-mini/config.toml)
+//   3. project: ./.scodex-mini/config.toml (cwd)
+//   4. tree:    parent dirs up to / looking for .scodex-mini/config.toml
+//   5. profile: $SCODEX_HOME/profiles/<name>.toml + [profiles.<name>] in user config
+//   6. runtime: SCODEX_* env vars (handled by config.sla, highest precedence)
+//
+// Design: ~/workspace/scodex-mini/docs/CONFIG_TOML_DESIGN.md
+
+@import "sa_std/env.sa"
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/vec.sa"
+@import "sa_std/core/slice.sa"
+@import "sa_std/io/print.sai"
+@import "sa_std/fs.sa"
+@import "slicex.sa"
+@import "toml_plugin.sla"
+@import "sessionx.sa"
+
+// SCODEX_HOME or ~/.scodex-mini
+// layer_copy_bytes: single X_COPY_BYTES wrapper to avoid fixed-label
+// conflicts when copying multiple times in one function.
+fn layer_copy_bytes(dest: ptr, src: ptr, len: u64) {
+    layer_copy_bytes(dest, src, len);
+}
+
+fn layer_home_dir() -> (ptr, u64) {
+    let st = sa_env_has(STR_PTR("SCODEX_HOME"), STR_LEN("SCODEX_HOME"));
+    if st == 0 {
+        let buf = ENV_GET_PTR(STR_PTR("SCODEX_HOME"), STR_LEN("SCODEX_HOME"));
+        let len = ENV_BUFFER_LEN(buf);
+        if len > 0 {
+            return (ENV_BUFFER_DATA(buf), len);
+        };
+    };
+    // Fallback: $HOME/.scodex-mini
+    let hs = sa_env_has(STR_PTR("HOME"), STR_LEN("HOME"));
+    if hs != 0 {
+        return (PTR_NULL(), 0);
+    };
+    let hbuf = ENV_GET_PTR(STR_PTR("HOME"), STR_LEN("HOME"));
+    let hlen = ENV_BUFFER_LEN(hbuf);
+    if hlen == 0 {
+        return (PTR_NULL(), 0);
+    };
+    let hptr = ENV_BUFFER_DATA(hbuf);
+    let suffix_len = STR_LEN("/.scodex-mini");
+    let total = hlen + suffix_len;
+    let out = X_HEAP_BUF_PTR(total);
+    layer_copy_bytes(out, hptr, hlen);
+    let _lc_tmp_1 = X_PTR_ADD(out, hlen);
+    layer_copy_bytes(_lc_tmp_1, STR_PTR("/.scodex-mini"), suffix_len);
+    return (out, total);
+}
+
+fn layer_join_path(dir_ptr: ptr, dir_len: u64, file_ptr: ptr, file_len: u64) -> (ptr, u64) {
+    // dir + "/" + file
+    let total = dir_len + 1 + file_len;
+    let out = X_HEAP_BUF_PTR(total);
+    layer_copy_bytes(out, dir_ptr, dir_len);
+    let slash = X_PTR_ADD(out, dir_len);
+    layer_copy_bytes(slash, STR_PTR("/"), 1);
+    let _lc_tmp_2 = X_PTR_ADD(out, dir_len + 1);
+    layer_copy_bytes(_lc_tmp_2, file_ptr, file_len);
+    return (out, total);
+}
+
+// Load a single TOML file. Returns entries (empty if missing/unparseable).
+fn layer_load_file(path_ptr: ptr, path_len: u64) -> Vec<TomlEntry> {
+    let empty: Vec<TomlEntry> = Vec::new();
+    if path_len == 0 {
+        return empty;
+    };
+    let fbuf: u64 = 0;
+    let fst = sa_std_fs_read_to_string(path_ptr, path_len, 1048576, &fbuf);
+    if fst != 0 {
+        return empty;
+    };
+    let flen = sa_fs_read_buffer_len(fbuf);
+    if flen == 0 {
+        return empty;
+    };
+    let fref = sa_fs_read_buffer_data(fbuf);
+    let fptr: ptr = fref;
+    return toml_parse(fptr, flen);
+}
+
+// Merge overlay into base: per-key, overlay wins.
+// Returns a new Vec (base is consumed).
+fn layer_merge(base: Vec<TomlEntry>, overlay: Vec<TomlEntry>) -> Vec<TomlEntry> {
+    let result: Vec<TomlEntry> = Vec::new();
+    // Copy base entries, skipping keys that exist in overlay.
+    let bi = 0;
+    let bn = base.len();
+    while bi < bn {
+        let be = base.get(bi);
+        // Check if overlay has this key.
+        let found = false;
+        let oi = 0;
+        let on = overlay.len();
+        while oi < on {
+            let oe = overlay.get(oi);
+            let eq = false;
+            X_STR_EQ(eq, be.key_ptr, be.key_len, oe.key_ptr, oe.key_len);
+            if eq == true {
+                found = true;
+            };
+            oi = oi + 1;
+        };
+        if found == false {
+            result.push(be);
+        };
+        bi = bi + 1;
+    };
+    // Append all overlay entries.
+    let oi2 = 0;
+    let on2 = overlay.len();
+    while oi2 < on2 {
+        result.push(overlay.get(oi2));
+        oi2 = oi2 + 1;
+    };
+    return result;
+}
+
+// Find an entry by dotted key. Returns (entry, found).
+fn layer_find(entries: Vec<TomlEntry>, key_ptr: ptr, key_len: u64) -> (TomlEntry, bool) {
+    let n = entries.len();
+    let i = 0;
+    // Search from the end (later layers win, they're appended last).
+    // Actually merge already dedupes, so first hit is fine. Search from end
+    // to be safe if merge wasn't applied.
+    while i < n {
+        let e = entries.get(n - 1 - i);
+        let eq = false;
+        X_STR_EQ(eq, e.key_ptr, e.key_len, key_ptr, key_len);
+        if eq == true {
+            return (e, true);
+        };
+        i = i + 1;
+    };
+    // Return a dummy entry when not found.
+    let dummy = TomlEntry {
+        key_ptr: PTR_NULL(),
+        key_len: 0,
+        val_ptr: PTR_NULL(),
+        val_len: 0,
+        val_kind: 0,
+    };
+    return (dummy, false);
+}
+
+// Get a string value by dotted key.
+fn layer_get_str(entries: Vec<TomlEntry>, key_ptr: ptr, key_len: u64) -> (ptr, u64, bool) {
+    let (e, found) = layer_find(entries, key_ptr, key_len);
+    if found == false {
+        return (PTR_NULL(), 0, false);
+    };
+    if e.val_kind != 0 {
+        return (PTR_NULL(), 0, false);
+    };
+    return (e.val_ptr, e.val_len, true);
+}
+
+// Parse a u64 from decimal bytes. Returns (value, ok).
+fn layer_parse_u64(p: ptr, len: u64) -> (u64, bool) {
+    if len == 0 {
+        return (0, false);
+    };
+    let val: u64 = 0;
+    let i = 0;
+    while i < len {
+        let b = layer_byte(p, i);
+        if b < 48 || b > 57 {
+            return (0, false);
+        };
+        val = val * 10 + ((b as u64) - 48);
+        i = i + 1;
+    };
+    return (val, true);
+}
+
+fn layer_get_u64(entries: Vec<TomlEntry>, key_ptr: ptr, key_len: u64) -> (u64, bool) {
+    let (e, found) = layer_find(entries, key_ptr, key_len);
+    if found == false {
+        return (0, false);
+    };
+    // Accept int kind, or string kind containing digits.
+    if e.val_kind == 1 {
+        return layer_parse_u64(e.val_ptr, e.val_len);
+    };
+    if e.val_kind == 0 {
+        return layer_parse_u64(e.val_ptr, e.val_len);
+    };
+    return (0, false);
+}
+
+fn layer_get_bool(entries: Vec<TomlEntry>, key_ptr: ptr, key_len: u64) -> (bool, bool) {
+    let (e, found) = layer_find(entries, key_ptr, key_len);
+    if found == false {
+        return (false, false);
+    };
+    if e.val_kind != 3 {
+        return (false, false);
+    };
+    // val is "true" or "false" bytes.
+    let is_true = false;
+    X_STR_EQ(is_true, e.val_ptr, e.val_len, STR_PTR("true"), STR_LEN("true"));
+    if is_true == true {
+        return (true, true);
+    };
+    return (false, true);
+}
+
+// Load all layers and merge. Profile is applied last.
+// profile_ptr/len: profile name (empty = no profile).
+fn config_layers_merged(profile_ptr: ptr, profile_len: u64) -> Vec<TomlEntry> {
+    let merged: Vec<TomlEntry> = Vec::new();
+
+    // 1. system: /etc/scodex-mini/config.toml
+    let sys_entries = layer_load_file(
+        STR_PTR("/etc/scodex-mini/config.toml"),
+        STR_LEN("/etc/scodex-mini/config.toml"));
+    merged = layer_merge(merged, sys_entries);
+
+    // 2. user: $SCODEX_HOME/config.toml
+    let (home_ptr, home_len) = layer_home_dir();
+    if home_len > 0 {
+        let (user_path, user_path_len) = layer_join_path(
+            home_ptr, home_len,
+            STR_PTR("config.toml"), STR_LEN("config.toml"));
+        let user_entries = layer_load_file(user_path, user_path_len);
+        merged = layer_merge(merged, user_entries);
+    };
+
+    // 3. project (cwd): ./.scodex-mini/config.toml
+    let cwd_entries = layer_load_file(
+        STR_PTR("./.scodex-mini/config.toml"),
+        STR_LEN("./.scodex-mini/config.toml"));
+    merged = layer_merge(merged, cwd_entries);
+
+    // 4. tree: parent dirs (up to 10 levels)
+    // NOTE: simplified — uses relative "../" paths.
+    let depth = 1;
+    while depth <= 10 {
+        // Build "../" * depth + ".scodex-mini/config.toml"
+        // For depth=1: "../.scodex-mini/config.toml"
+        // For depth=2: "../../.scodex-mini/config.toml"
+        let prefix_len = depth * 3;
+        let suffix_len = STR_LEN(".scodex-mini/config.toml");
+        let total = prefix_len + suffix_len;
+        let pbuf = X_HEAP_BUF_PTR(total);
+        let d = 0;
+        while d < depth {
+            let _lc_tmp_3 = X_PTR_ADD(pbuf, d * 3);
+            layer_copy_bytes(_lc_tmp_3, STR_PTR("../"), 3);
+            d = d + 1;
+        };
+        let _lc_tmp_4 = X_PTR_ADD(pbuf, prefix_len);
+        layer_copy_bytes(_lc_tmp_4,
+            STR_PTR(".scodex-mini/config.toml"), suffix_len);
+        let tree_entries = layer_load_file(pbuf, total);
+        // Tree layers: farther dirs have LOWER precedence, so we need to
+        // merge them BEFORE closer ones. Since we're going outward, we
+        // prepend: merge(tree, merged) instead of merge(merged, tree).
+        merged = layer_merge(tree_entries, merged);
+        depth = depth + 1;
+    };
+
+    // 5. profile
+    if profile_len > 0 {
+        // 5a. Profile file: $SCODEX_HOME/profiles/<name>.toml
+        if home_len > 0 {
+            let (prof_dir, prof_dir_len) = layer_join_path(
+                home_ptr, home_len,
+                STR_PTR("profiles"), STR_LEN("profiles"));
+            let fname_len = profile_len + STR_LEN(".toml");
+            let fbuf = X_HEAP_BUF_PTR(fname_len);
+            layer_copy_bytes(fbuf, profile_ptr, profile_len);
+            let _lc_tmp_5 = X_PTR_ADD(fbuf, profile_len);
+            layer_copy_bytes(_lc_tmp_5,
+                STR_PTR(".toml"), STR_LEN(".toml"));
+            let (prof_path, prof_path_len) = layer_join_path(
+                prof_dir, prof_dir_len, fbuf, fname_len);
+            let prof_entries = layer_load_file(prof_path, prof_path_len);
+            merged = layer_merge(merged, prof_entries);
+        };
+        // 5b. Inline [profiles.<name>] in merged config.
+        // Extract keys starting with "profiles.<name>." and re-key them
+        // without the prefix.
+        let prefix_len = STR_LEN("profiles.") + profile_len + 1;
+        let prefix_buf = X_HEAP_BUF_PTR(prefix_len);
+        layer_copy_bytes(prefix_buf, STR_PTR("profiles."), STR_LEN("profiles."));
+        let _lc_tmp_6 = X_PTR_ADD(prefix_buf, STR_LEN("profiles."));
+        layer_copy_bytes(_lc_tmp_6,
+            profile_ptr, profile_len);
+        let _lc_tmp_7 = X_PTR_ADD(prefix_buf, STR_LEN("profiles.") + profile_len);
+        layer_copy_bytes(_lc_tmp_7,
+            STR_PTR("."), 1);
+        let prof_inline: Vec<TomlEntry> = Vec::new();
+        let n = merged.len();
+        let i = 0;
+        while i < n {
+            let e = merged.get(i);
+            // Check if key starts with prefix.
+            if e.key_len > prefix_len {
+                let matches = false;
+                // Compare first prefix_len bytes.
+                let mi = 0;
+                let mok = true;
+                while mi < prefix_len {
+                    let eb = layer_byte(e.key_ptr, mi);
+                    let pb = layer_byte(prefix_buf, mi);
+                    if eb != pb {
+                        mok = false;
+                    };
+                    mi = mi + 1;
+                };
+                if mok == true {
+                    // Strip prefix, create new entry.
+                    let new_key_len = e.key_len - prefix_len;
+                    let new_key = X_HEAP_BUF_PTR(new_key_len);
+                    layer_copy_bytes(new_key,
+                        X_PTR_ADD(e.key_ptr, prefix_len), new_key_len);
+                    let ne = TomlEntry {
+                        key_ptr: new_key,
+                        key_len: new_key_len,
+                        val_ptr: e.val_ptr,
+                        val_len: e.val_len,
+                        val_kind: e.val_kind,
+                    };
+                    prof_inline.push(ne);
+                };
+            };
+            i = i + 1;
+        };
+        merged = layer_merge(merged, prof_inline);
+    };
+
+    return merged;
+}
+
+@test "layer merge: overlay wins"() {
+    let base: Vec<TomlEntry> = Vec::new();
+    let ov: Vec<TomlEntry> = Vec::new();
+    // Manually construct entries (toml.sla not needed for merge logic).
+    let k1 = X_HEAP_BUF_PTR(STR_LEN("model"));
+    layer_copy_bytes(k1, STR_PTR("model"), STR_LEN("model"));
+    let v1 = X_HEAP_BUF_PTR(STR_LEN("gpt-4"));
+    layer_copy_bytes(v1, STR_PTR("gpt-4"), STR_LEN("gpt-4"));
+    let v2 = X_HEAP_BUF_PTR(STR_LEN("gpt-5"));
+    layer_copy_bytes(v2, STR_PTR("gpt-5"), STR_LEN("gpt-5"));
+    base.push(TomlEntry {
+        key_ptr: k1, key_len: STR_LEN("model"),
+        val_ptr: v1, val_len: STR_LEN("gpt-4"), val_kind: 0,
+    });
+    ov.push(TomlEntry {
+        key_ptr: k1, key_len: STR_LEN("model"),
+        val_ptr: v2, val_len: STR_LEN("gpt-5"), val_kind: 0,
+    });
+    let merged = layer_merge(base, ov);
+    if merged.len() != 1 { panic(201); };
+    let (sp, sl, ok) = layer_get_str(merged,
+        STR_PTR("model"), STR_LEN("model"));
+    if ok != true { panic(202); };
+    let eq = false;
+    X_STR_EQ(eq, sp, sl, STR_PTR("gpt-5"), STR_LEN("gpt-5"));
+    if eq != true { panic(203); };
+}
+
+@test "layer parse u64"() {
+    let (v, ok) = layer_parse_u64(STR_PTR("32000"), STR_LEN("32000"));
+    if ok != true { panic(211); };
+    if v != 32000 { panic(212); };
+    let (_, ok2) = layer_parse_u64(STR_PTR("abc"), STR_LEN("abc"));
+    if ok2 != false { panic(213); };
+}
