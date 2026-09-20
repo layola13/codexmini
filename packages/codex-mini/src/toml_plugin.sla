@@ -58,7 +58,7 @@ fn toml_parse(src_ptr: ptr, src_len: u64) -> Vec<TomlEntry> {
             result.push(e);
         };
         i = i + 1;
-    };
+    }
     sa_toml_free(handle);
     return result;
 }

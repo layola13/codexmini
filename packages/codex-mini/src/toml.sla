@@ -730,7 +730,7 @@ fn toml_test_find(entries: Vec<TomlEntry>, key_ptr: ptr, key_len: u64) -> (TomlE
     var i: u64;
     i = 0;
     while i < n {
-        let e = entries.get(i);
+        let e = entries[i];
         let eq = false;
         X_STR_EQ(eq, e.key_ptr, e.key_len, key_ptr, key_len);
         if eq == true {

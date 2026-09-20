@@ -83,6 +83,13 @@ L_XSEQ_END_%out_bool:
     %out_ptr = stack_alloc 8192
 [END_MACRO]
 
+// LAYER_BYTE_AT %out, %base, %idx — load one byte (as u64) from base+idx.
+[MACRO] LAYER_BYTE_AT %out, %base, %idx
+    __lbat_p_%out = ptr_add %base, %idx
+    %out = load __lbat_p_%out+0 as u8
+    !__lbat_p_%out
+[END_MACRO]
+
 // X_COPY_BYTES: copies len bytes from src to dest (statement, no output)
 // X_COPY_BYTES: copies len bytes from src to dest (statement, no output)
 // Uses a global counter for unique names to avoid PHI issues.

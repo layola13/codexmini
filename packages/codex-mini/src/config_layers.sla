@@ -25,7 +25,13 @@
 // layer_copy_bytes: single X_COPY_BYTES wrapper to avoid fixed-label
 // conflicts when copying multiple times in one function.
 fn layer_copy_bytes(dest: ptr, src: ptr, len: u64) {
-    layer_copy_bytes(dest, src, len);
+    X_COPY_BYTES(dest, src, len);
+}
+
+fn layer_byte(p: ptr, i: u64) -> u64 {
+    let b: u64 = 0;
+    LAYER_BYTE_AT(b, p, i);
+    return b;
 }
 
 fn layer_home_dir() -> (ptr, u64) {
@@ -97,32 +103,32 @@ fn layer_merge(base: Vec<TomlEntry>, overlay: Vec<TomlEntry>) -> Vec<TomlEntry> 
     let bi = 0;
     let bn = base.len();
     while bi < bn {
-        let be = base.get(bi);
+        let be = base[bi];
         // Check if overlay has this key.
         let found = false;
         let oi = 0;
         let on = overlay.len();
         while oi < on {
-            let oe = overlay.get(oi);
+            let oe = overlay[oi];
             let eq = false;
             X_STR_EQ(eq, be.key_ptr, be.key_len, oe.key_ptr, oe.key_len);
             if eq == true {
                 found = true;
             };
             oi = oi + 1;
-        };
+        }
         if found == false {
             result.push(be);
         };
         bi = bi + 1;
-    };
+    }
     // Append all overlay entries.
     let oi2 = 0;
     let on2 = overlay.len();
     while oi2 < on2 {
-        result.push(overlay.get(oi2));
+        result.push(overlay[oi2]);
         oi2 = oi2 + 1;
-    };
+    }
     return result;
 }
 
@@ -134,14 +140,14 @@ fn layer_find(entries: Vec<TomlEntry>, key_ptr: ptr, key_len: u64) -> (TomlEntry
     // Actually merge already dedupes, so first hit is fine. Search from end
     // to be safe if merge wasn't applied.
     while i < n {
-        let e = entries.get(n - 1 - i);
+        let e = entries[n - 1 - i];
         let eq = false;
         X_STR_EQ(eq, e.key_ptr, e.key_len, key_ptr, key_len);
         if eq == true {
             return (e, true);
         };
         i = i + 1;
-    };
+    }
     // Return a dummy entry when not found.
     let dummy = TomlEntry {
         key_ptr: PTR_NULL(),
@@ -179,7 +185,7 @@ fn layer_parse_u64(p: ptr, len: u64) -> (u64, bool) {
         };
         val = val * 10 + ((b as u64) - 48);
         i = i + 1;
-    };
+    }
     return (val, true);
 }
 
@@ -258,7 +264,7 @@ fn config_layers_merged(profile_ptr: ptr, profile_len: u64) -> Vec<TomlEntry> {
             let _lc_tmp_3 = X_PTR_ADD(pbuf, d * 3);
             layer_copy_bytes(_lc_tmp_3, STR_PTR("../"), 3);
             d = d + 1;
-        };
+        }
         let _lc_tmp_4 = X_PTR_ADD(pbuf, prefix_len);
         layer_copy_bytes(_lc_tmp_4,
             STR_PTR(".scodex-mini/config.toml"), suffix_len);
@@ -268,7 +274,7 @@ fn config_layers_merged(profile_ptr: ptr, profile_len: u64) -> Vec<TomlEntry> {
         // prepend: merge(tree, merged) instead of merge(merged, tree).
         merged = layer_merge(tree_entries, merged);
         depth = depth + 1;
-    };
+    }
 
     // 5. profile
     if profile_len > 0 {
@@ -304,7 +310,7 @@ fn config_layers_merged(profile_ptr: ptr, profile_len: u64) -> Vec<TomlEntry> {
         let n = merged.len();
         let i = 0;
         while i < n {
-            let e = merged.get(i);
+            let e = merged[i];
             // Check if key starts with prefix.
             if e.key_len > prefix_len {
                 let matches = false;
@@ -318,7 +324,7 @@ fn config_layers_merged(profile_ptr: ptr, profile_len: u64) -> Vec<TomlEntry> {
                         mok = false;
                     };
                     mi = mi + 1;
-                };
+                }
                 if mok == true {
                     // Strip prefix, create new entry.
                     let new_key_len = e.key_len - prefix_len;
@@ -336,7 +342,7 @@ fn config_layers_merged(profile_ptr: ptr, profile_len: u64) -> Vec<TomlEntry> {
                 };
             };
             i = i + 1;
-        };
+        }
         merged = layer_merge(merged, prof_inline);
     };
 
